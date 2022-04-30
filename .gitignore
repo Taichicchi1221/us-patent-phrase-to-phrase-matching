@@ -1,0 +1,6 @@
+datasets/*
+input/*
+mlruns/*
+work/*
+*/__pycache__
+kaggle.json

@@ -1,0 +1,1277 @@
+import os
+import gc
+import re
+import sys
+import copy
+import time
+import glob
+import math
+import random
+import psutil
+import shutil
+import typing
+import numbers
+import warnings
+import argparse
+from pathlib import Path
+from datetime import datetime
+from collections.abc import MutableMapping, Iterable
+from abc import ABC, ABCMeta, abstractmethod
+
+import json
+import yaml
+
+from tqdm.auto import tqdm
+
+import joblib
+
+from box import Box
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import mean_squared_error
+from sklearn.neighbors import NearestNeighbors, NeighborhoodComponentsAnalysis
+from sklearn.impute import KNNImputer
+
+from scipy.stats import pearsonr
+
+import transformers
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda import amp
+import torchtext
+import torchmetrics
+
+import pytorch_pfn_extras as ppe
+from pytorch_pfn_extras.config import Config
+
+import mlflow
+
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+tqdm.pandas()
+
+# ====================================================
+# utils
+# ====================================================
+
+
+def flatten_dict(
+    params: typing.Dict[typing.Any, typing.Any], delimiter: str = "/"
+) -> typing.Dict[str, typing.Any]:
+    """
+    https://github.com/PyTorchLightning/pytorch-lightning/blob/master/pytorch_lightning/loggers/base.py
+
+    Flatten hierarchical dict, e.g. ``{'a': {'b': 'c'}} -> {'a/b': 'c'}``.
+    Args:
+        params: Dictionary containing the hyperparameters
+        delimiter: Delimiter to express the hierarchy. Defaults to ``'/'``.
+    Returns:
+        Flattened dict.
+    Examples:
+        >>> LightningLoggerBase._flatten_dict({'a': {'b': 'c'}})
+        {'a/b': 'c'}
+        >>> LightningLoggerBase._flatten_dict({'a': {'b': 123}})
+        {'a/b': 123}
+        >>> LightningLoggerBase._flatten_dict({5: {'a': 123}})
+        {'5/a': 123}
+    """
+
+    def _dict_generator(input_dict, prefixes=None):
+        prefixes = prefixes[:] if prefixes else []
+        if isinstance(input_dict, typing.MutableMapping):
+            for key, value in input_dict.items():
+                key = str(key)
+                if isinstance(value, (typing.MutableMapping, argparse.Namespace)):
+                    value = (
+                        vars(value) if isinstance(value, argparse.Namespace) else value
+                    )
+                    yield from _dict_generator(value, prefixes + [key])
+                else:
+                    yield prefixes + [key, value if value is not None else str(None)]
+        else:
+            yield prefixes + [input_dict if input_dict is None else str(input_dict)]
+
+    return {delimiter.join(keys): val for *keys, val in _dict_generator(params)}
+
+
+def memory_used_to_str():
+    pid = os.getpid()
+    processs = psutil.Process(pid)
+    memory_use = processs.memory_info()[0] / 2.0**30
+    return "ram memory gb :" + str(np.round(memory_use, 2))
+
+
+def seed_everything(seed: int = 42, deterministic: bool = False):
+    """Set seeds"""
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)  # type: ignore
+    torch.backends.cudnn.deterministic = deterministic  # type: ignore
+
+
+def clear_work(directory):
+    shutil.rmtree(directory)
+    os.makedirs(directory)
+
+
+# ====================================================
+# plots
+# ====================================================
+def plot_dist(ytrue, ypred, filename):
+    plt.figure()
+    plt.hist(ytrue, alpha=0.5, bins=20)
+    plt.hist(ypred, alpha=0.5, bins=20)
+    plt.legend(["ytrue", "ypred"])
+    plt.savefig(filename)
+    plt.close()
+
+
+def plot_scatter(ytrue, ypred, filename):
+    plt.figure()
+    sns.scatterplot(x=ypred, y=ytrue)
+    plt.savefig(filename)
+    plt.close()
+
+
+# ====================================================
+# extensions
+# ====================================================
+class Evaluator(ppe.training.extension.Extension):
+    priority = ppe.training.extension.PRIORITY_WRITER
+
+    def __init__(self, model, device, metrics, loader, prefix):
+        self.model = model
+        self.device = device
+        self.metrics = metrics
+        self.prefix = prefix
+        self.loader = loader
+
+    def __call__(self, manager):
+        self.model.eval()
+        with torch.no_grad():
+            for batch in self.loader:
+                x, y = batch
+                for k in x.keys():
+                    x[k] = x[k].to(self.device)
+                y = y.to(self.device)
+
+                yhat = self.model(x).detach().cpu().float()
+
+                for name, metric in self.metrics.items():
+                    metric.update(yhat, y.detach().cpu())
+
+        for name, metric in self.metrics.items():
+            value = metric.compute()
+            ppe.reporting.report({self.prefix + name: value})
+
+
+# ====================================================
+# data processing
+# ====================================================
+
+
+def get_cpc_texts(input_dir):
+    contexts = []
+    pattern = "[A-Z]\d+"
+    for file_name in os.listdir(os.path.join(input_dir, "CPCSchemeXML202105")):
+        result = re.findall(pattern, file_name)
+        if result:
+            contexts.append(result)
+    contexts = sorted(set(sum(contexts, [])))
+    results = {}
+    for cpc in ["A", "B", "C", "D", "E", "F", "G", "H", "Y"]:
+        with open(
+            os.path.join(
+                input_dir,
+                f"CPCTitleList202202/cpc-section-{cpc}_20220201.txt",
+            )
+        ) as f:
+            s = f.read()
+        pattern = f"{cpc}\t\t.+"
+        result = re.findall(pattern, s)
+        cpc_result = result[0].lstrip(pattern)
+        for context in [c for c in contexts if c[0] == cpc]:
+            pattern = f"{context}\t\t.+"
+            result = re.findall(pattern, s)
+            results[context] = cpc_result + ". " + result[0].lstrip(pattern)
+    return results
+
+
+def prepare_fold(df: pd.DataFrame, n_fold: int, seed: int):
+    skf = StratifiedKFold(n_splits=n_fold, shuffle=True, random_state=seed)
+    fold_array = -np.ones(len(df), dtype=np.int64)
+    for fold, (train_idx, valid_idx) in enumerate(
+        skf.split(df, df["score"].astype(str))
+    ):
+        fold_array[valid_idx] = fold
+    df["fold"] = fold_array
+
+
+# ====================================================
+# loss
+# ====================================================
+
+
+# ====================================================
+# metrics
+# ====================================================
+class BCEMetric(torchmetrics.Metric):
+    def __init__(
+        self,
+        compute_on_step: bool = True,
+        dist_sync_on_step: bool = False,
+        process_group: typing.Optional[typing.Any] = None,
+        dist_sync_fn: typing.Callable = None,
+    ) -> None:
+        super().__init__(
+            compute_on_step=compute_on_step,
+            dist_sync_on_step=dist_sync_on_step,
+            process_group=process_group,
+            dist_sync_fn=dist_sync_fn,
+        )
+        self.value = 0
+        self.l = 0
+
+    def update(self, yhat, y):
+        self.value += F.binary_cross_entropy(yhat, y, reduction="sum")
+        self.l += 1
+
+    def compute(self):
+        return self.value / self.l
+
+
+# ====================================================
+# optimizer
+# ====================================================
+class Lamb(torch.optim.Optimizer):
+    # Reference code: https://github.com/cybertronai/pytorch-lamb
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas=(0.9, 0.999),
+        eps: float = 1e-6,
+        weight_decay: float = 0,
+        clamp_value: float = 10,
+        adam: bool = False,
+        debias: bool = False,
+    ):
+        if lr <= 0.0:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if eps < 0.0:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if weight_decay < 0:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+        if clamp_value < 0.0:
+            raise ValueError("Invalid clamp value: {}".format(clamp_value))
+
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.clamp_value = clamp_value
+        self.adam = adam
+        self.debias = debias
+
+        super(Lamb, self).__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    msg = (
+                        "Lamb does not support sparse gradients, "
+                        "please consider SparseAdam instead"
+                    )
+                    raise RuntimeError(msg)
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+
+                state["step"] += 1
+
+                # Decay the first and second moment running average coefficient
+                # m_t
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                # v_t
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Paper v3 does not use debiasing.
+                if self.debias:
+                    bias_correction = math.sqrt(1 - beta2 ** state["step"])
+                    bias_correction /= 1 - beta1 ** state["step"]
+                else:
+                    bias_correction = 1
+
+                # Apply bias to lr to avoid broadcast.
+                step_size = group["lr"] * bias_correction
+
+                weight_norm = torch.norm(p.data).clamp(0, self.clamp_value)
+
+                adam_step = exp_avg / exp_avg_sq.sqrt().add(group["eps"])
+                if group["weight_decay"] != 0:
+                    adam_step.add_(p.data, alpha=group["weight_decay"])
+
+                adam_norm = torch.norm(adam_step)
+                if weight_norm == 0 or adam_norm == 0:
+                    trust_ratio = 1
+                else:
+                    trust_ratio = weight_norm / adam_norm
+                state["weight_norm"] = weight_norm
+                state["adam_norm"] = adam_norm
+                state["trust_ratio"] = trust_ratio
+                if self.adam:
+                    trust_ratio = 1
+
+                p.data.add_(adam_step, alpha=-step_size * trust_ratio)
+
+        return loss
+
+
+class SAM(torch.optim.Optimizer):
+    # https://github.com/davda54/sam/blob/main/sam.py
+
+    def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+
+        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        super(SAM, self).__init__(params, defaults)
+
+        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                self.state[p]["old_p"] = p.data.clone()
+                e_w = (
+                    (torch.pow(p, 2) if group["adaptive"] else 1.0)
+                    * p.grad
+                    * scale.to(p)
+                )
+                p.add_(e_w)  # climb to the local maximum "w + e(w)"
+
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p.data = self.state[p]["old_p"]  # get back to "w" from "w + e(w)"
+
+        self.base_optimizer.step()  # do the actual "sharpness-aware" update
+
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        assert (
+            closure is not None
+        ), "Sharpness Aware Minimization requires closure, but it was not provided"
+        closure = torch.enable_grad()(
+            closure
+        )  # the closure should do a full forward-backward pass
+
+        self.first_step(zero_grad=True)
+        closure()
+        self.second_step()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]["params"][
+            0
+        ].device  # put everything on the same device, in case of model parallelism
+        norm = torch.norm(
+            torch.stack(
+                [
+                    ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad)
+                    .norm(p=2)
+                    .to(shared_device)
+                    for group in self.param_groups
+                    for p in group["params"]
+                    if p.grad is not None
+                ]
+            ),
+            p=2,
+        )
+        return norm
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.base_optimizer.param_groups = self.param_groups
+
+
+# ====================================================
+# dataset
+# ====================================================
+class Dataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        df=None,
+        tokenizer=None,
+    ):
+        self.df = df
+        self.tokenizer = tokenizer
+        if self.df is not None:
+            self.length = len(self.df)
+
+    def __len__(
+        self,
+    ):
+        return self.length
+
+    def lazy_init(
+        self,
+        df=None,
+        tokenizer=None,
+    ):
+        """Reset Members"""
+        if df is not None:
+            self.df = df
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        if self.df is not None:
+            self.length = len(self.df)
+
+    def __getitem__(self, idx):
+        items = self.preprocess(self.df.iloc[idx])
+        return items
+
+    def preprocess(self, ser: pd.Series) -> dict:
+        """preprocess input
+
+        Args:
+            ser (pd.Series): self.df.iloc[idx]
+
+        Returns:
+            dict: dict of preprocessed items
+        """
+
+        text = (
+            ser["anchor"]
+            + " "
+            + self.tokenizer.tokenizer.sep_token
+            + " "
+            + ser["target"]
+        )
+
+        encoded = self.tokenizer.encode(text)
+        score = ser["score"].astype("float32")
+
+        return (encoded, score)
+
+    @classmethod
+    def postprocess(cls, d: dict):
+        """_summary_
+
+        Args:
+            d (dict): _description_
+
+        Returns:
+            pd.Series: _description_
+        """
+
+        return pd.Series()
+
+
+# ====================================================
+# tokenizer
+# ====================================================
+
+
+class Tokenizer(object):
+    def __init__(self, tokenizer_path, tokenizer_params, max_length) -> None:
+        self.config = transformers.AutoConfig.from_pretrained(tokenizer_path)
+        self.config.update(tokenizer_params)
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_path)
+        self.max_length = max_length
+
+    def encode(self, text):
+        encoded = self.tokenizer.encode_plus(
+            text,
+            truncation=True,
+            padding="max_length",
+            pad_to_max_length=True,
+            max_length=self.max_length,
+            return_token_type_ids=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        return {key: val.squeeze(0) for key, val in encoded.items()}
+
+
+# ====================================================
+# model
+# ====================================================
+
+
+class SimpleHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        dropout_rate,
+    ):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(in_features)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.linear = nn.Linear(in_features=in_features, out_features=out_features)
+
+    def forward(self, last_hidden_state):
+        x = self.layer_norm(last_hidden_state[:, 0, :])
+        x = self.dropout(x)
+        output = self.linear(x)
+        return output
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+    ):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(in_features, hidden_features),
+            nn.Tanh(),
+            nn.Linear(hidden_features, 1),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x):
+        weights = self.attention(x)
+        output = torch.sum(weights * x, dim=1).squeeze(-1)
+        return output
+
+
+class AttentionHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        out_features,
+        dropout_rate=0.5,
+    ):
+        super().__init__()
+
+        self.attention = Attention(in_features, hidden_features)
+        self.layer_norm = nn.LayerNorm(in_features)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        x = self.attention(x)
+        x = self.layer_norm(x)
+        x = self.dropout(x)
+        output = self.linear(x)
+        return output
+
+
+class AttentionMultiDropoutHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        dropout_num=5,
+        dropout_rate=0.5,
+    ):
+        super().__init__()
+
+        self.attention = Attention(in_features, hidden_features)
+        self.layer_norm = nn.LayerNorm(in_features)
+        self.dropouts = nn.ModuleList(
+            [nn.Dropout(dropout_rate) for _ in range(dropout_num)]
+        )
+        self.linears = nn.ModuleList(
+            [nn.Linear(in_features, 1) for _ in range(dropout_num)]
+        )
+
+    def forward(self, x):
+        x = self.attention(x)
+        x = self.layer_norm(x)
+        output = torch.mean(
+            torch.cat(
+                [
+                    linear(dropout(x))
+                    for dropout, linear in zip(self.dropouts, self.linears)
+                ],
+                -1,
+            ),
+            -1,
+        )
+        return output
+
+
+class MeanPoolingHead(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(in_features)
+        self.linear = nn.Linear(in_features, out_features)
+        nn.init.constant_(self.linear.bias, -1.0)
+
+    def forward(self, last_hidden_state, attention_mask):
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        )
+        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+        norm_mean_embeddings = self.layer_norm(mean_embeddings)
+        logits = self.linear(norm_mean_embeddings).squeeze(-1)
+
+        return logits
+
+
+class LSTMHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        dropout,
+    ):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=in_features,
+            hidden_size=in_features,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout,
+        )
+        self.layer_norm = nn.LayerNorm(in_features * 2)
+        self.linear = nn.Linear(in_features * 2, out_features)
+
+    def forward(self, last_hidden_state):
+        x, _ = self.lstm(last_hidden_state, None)
+        x = self.layer_norm(x[:, -1, :])
+        output = self.linear(x)
+        return output
+
+
+class GRUHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        dropout,
+    ):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=in_features,
+            hidden_size=in_features,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout,
+        )
+        self.layer_norm = nn.LayerNorm(in_features * 2)
+        self.linear = nn.Linear(in_features * 2, out_features)
+
+    def forward(self, last_hidden_state):
+        x, _ = self.gru(last_hidden_state, None)
+        x = self.layer_norm(x[:, -1, :])
+        output = self.linear(x)
+        return output.squeeze(-1)
+
+
+class CNNHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        hidden_size,
+        kernel_size,
+    ):
+        super().__init__()
+        self.cnn1 = nn.Conv1d(
+            in_features, hidden_size, kernel_size=kernel_size, padding=1
+        )
+        self.cnn2 = nn.Conv1d(
+            hidden_size, out_features, kernel_size=kernel_size, padding=1
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, last_hidden_state):
+        x = last_hidden_state.permute(0, 2, 1)
+        x = self.cnn1(x)
+        x = self.relu(x)
+        x = self.cnn2(x)
+        x, _ = torch.max(x, 2)
+        return x
+
+
+class Model(nn.Module):
+    def __init__(
+        self,
+        encoder_name,
+        encoder_path,
+        encoder_params,
+        head_type,
+        head_params,
+    ):
+        super().__init__()
+
+        # model
+        config = transformers.AutoConfig.from_pretrained(encoder_path)
+        config.update(encoder_params)
+        self.encoder = transformers.AutoModel.from_pretrained(
+            encoder_path,
+            config=config,
+        )
+
+        self.head = eval(head_type)(in_features=config.hidden_size, **head_params)
+
+    def forward(self, x):
+        last_hidden_state = self.encoder(**x)["last_hidden_state"]
+        if type(self.head) is MeanPoolingHead:
+            output = self.head(last_hidden_state, x["attention_mask"])
+        else:
+            output = self.head(last_hidden_state)
+        return torch.sigmoid(output.view(-1))
+
+
+# ====================================================
+# train fold
+# ====================================================
+def train_fold(CFG, fold):
+    print("#" * 30, f"fold: {fold}", "#" * 30)
+
+    torch.backends.cudnn.benchmark = CFG["/globals/benchmark"]
+    seed_everything(CFG["/globals/seed"], deterministic=CFG["/globals/deterministic"])
+    device = torch.device(CFG["/globals/device"])
+
+    train_dataloader = CFG["/dataloader/train"]
+    valid_dataloader = CFG["/dataloader/valid"]
+
+    model = CFG["/model"]
+    model.to(device)
+    optimizer = CFG["/optimizer"]
+    scheduler = CFG["/scheduler"]
+    loss_func = CFG["/loss"]
+    loss_func.to(device)
+
+    use_amp = CFG["/globals/use_amp"]
+    scaler = amp.GradScaler(enabled=use_amp)
+
+    manager = CFG["/manager"]
+    for ext in CFG["/extensions"]:
+        manager.extend(**ext)
+
+    while not manager.stop_trigger:
+        model.train()
+        for batch in train_dataloader:
+            with manager.run_iteration():
+                x, y = batch
+                for k in x.keys():
+                    x[k] = x[k].to(device)
+                y = y.to(device)
+
+                optimizer.zero_grad()
+                with amp.autocast(use_amp):
+                    yhat = model(x)
+                    loss = loss_func(yhat, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                ppe.reporting.report({"loss": loss.item()})
+            scheduler.step()
+
+    del train_dataloader, valid_dataloader, model, device
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# ====================================================
+# inference
+# ====================================================
+def inference(stage, model_path, CFG):
+    dataloader = CFG[f"/dataloader/{stage}"]
+
+    model = CFG["/model"]
+    device = CFG["/globals/device"]
+    model.load_state_dict(torch.load(model_path))
+    model.to(device)
+    model.eval()
+    pred_list = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="predicting..."):
+            x, y = batch
+            for k in x.keys():
+                x[k] = x[k].to(device)
+
+            yhat = model(x)
+            pred_list.append(yhat.detach().cpu().numpy())
+
+    del model, device
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return np.concatenate(pred_list)
+
+
+# ====================================================
+# main
+# ====================================================
+def training_main(PRE_EVAL_CFG, results):
+
+    train_df = pd.read_csv(Path(PRE_EVAL_CFG["globals"]["input_dir"], "train.csv"))
+
+    # debug?
+    if PRE_EVAL_CFG["globals"]["debug"]:
+        train_df = train_df.sample(
+            1000, random_state=PRE_EVAL_CFG["globals"]["seed"]
+        ).reset_index(drop=True)
+
+    print(f"train length = {len(train_df)}")
+
+    # folds
+    prepare_fold(
+        df=train_df,
+        n_fold=PRE_EVAL_CFG["globals"]["n_fold"],
+        seed=PRE_EVAL_CFG["globals"]["seed"],
+    )
+
+    # prepare
+    oof_df = pd.DataFrame(
+        {
+            "id": train_df["id"],
+            "count": np.zeros(len(train_df)),
+            "score": np.zeros(len(train_df)),
+        }
+    )
+    for fold in range(PRE_EVAL_CFG["globals"]["n_fold"]):
+        train_idx = train_df.loc[train_df["fold"] != fold].index
+        valid_idx = train_df.loc[train_df["fold"] == fold].index
+
+        FOLD_PRE_EVAL_CFG = copy.deepcopy(PRE_EVAL_CFG)
+        FOLD_PRE_EVAL_CFG["globals"]["fold"] = fold
+        CFG = Config(FOLD_PRE_EVAL_CFG, types=CONFIG_TYPES)
+        model_path = CFG["/model_filename"]
+
+        CFG["/dataset/train"].lazy_init(df=train_df.loc[train_idx])
+        CFG["/dataset/valid"].lazy_init(df=train_df.loc[valid_idx])
+
+        train_fold(CFG=CFG, fold=fold)
+
+        oof_prediction = inference(stage="valid", model_path=model_path, CFG=CFG)
+        oof_df.loc[valid_idx, "count"] += 1
+        oof_df.loc[valid_idx, "score"] += oof_prediction
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        results.model_paths.append(model_path)
+
+    oof_df["score"] = oof_df["score"] / oof_df["count"]
+    oof_df.drop(columns="count", inplace=True)
+    oof_df.to_csv("oof.csv", index=False)
+
+    metric = CFG["/metric/metric"]
+    metric(
+        torch.tensor(train_df["score"]).float(),
+        torch.tensor(oof_df["score"]).float(),
+    )
+    validation_score = float(metric.compute().detach().cpu().numpy())
+
+    print(f"validation score: {validation_score}")
+    results.metrics.update({"valid_score": validation_score})
+
+    # plots
+    plot_dist(train_df["score"], oof_df["score"], filename="oof_dist_plot.png")
+    plot_scatter(train_df["score"], oof_df["score"], filename="oof_scatter_plot.png")
+
+
+def inference_main(PRE_EVAL_CFG, results):
+    test_df = pd.read_csv(Path(PRE_EVAL_CFG["globals"]["input_dir"], "test.csv"))
+    test_df["score"] = 0
+    print(f"test images = {len(test_df)}")
+
+    submission_df = pd.DataFrame(
+        {
+            "id": test_df["id"],
+            "count": np.zeros(len(test_df)),
+            "score": np.zeros(len(test_df)),
+        }
+    )
+
+    for fold, model_path in enumerate(results.model_paths):
+        print("#" * 30, f"fold: {fold}", "#" * 30)
+        print("#" * 30, f"model path: {model_path}", "#" * 30)
+
+        CFG = Config(PRE_EVAL_CFG, types=CONFIG_TYPES)
+
+        CFG["/dataset/test"].lazy_init(df=test_df)
+
+        test_prediction = inference(stage="test", model_path=model_path, CFG=CFG)
+        submission_df["count"] += 1
+        submission_df["score"] += test_prediction
+
+    submission_df["score"] = submission_df["score"] / submission_df["count"]
+    submission_df.drop(columns="count", inplace=True)
+    submission_df.to_csv("submission.csv", index=False)
+    results.metrics.update({"public_lb": np.nan})
+    results.metrics.update({"private_lb": np.nan})
+
+
+# ====================================================
+# save results
+# ====================================================
+
+
+def save_results_main(PRE_EVAL_CFG, results):
+    print(results)
+
+    client = mlflow.tracking.MlflowClient(PRE_EVAL_CFG["mlflow"]["save_dir"])
+    try:
+        experiment_id = client.create_experiment(
+            PRE_EVAL_CFG["mlflow"]["experiment_name"]
+        )
+    except:
+        experiment = client.get_experiment_by_name(
+            PRE_EVAL_CFG["mlflow"]["experiment_name"]
+        )
+        experiment_id = experiment.experiment_id
+
+    run = client.create_run(experiment_id)
+
+    # desc
+    if os.path.exists(str(globals().get("__file__"))):
+        dir_ = os.path.join(os.path.dirname(__file__), PRE_EVAL_CFG["RUN_NAME"])
+        os.makedirs(dir_, exist_ok=True)
+        shutil.copy(__file__, os.path.join(dir_, "work.py"))
+        with open(os.path.join(dir_, "desc.txt"), "w") as f:
+            f.write(PRE_EVAL_CFG["RUN_DESC"])
+
+    client.log_param(run.info.run_id, "name", PRE_EVAL_CFG["RUN_NAME"])
+    client.log_param(run.info.run_id, "desc", PRE_EVAL_CFG["RUN_DESC"])
+
+    # params
+    results.params = PRE_EVAL_CFG
+    for key, value in flatten_dict(results.params).items():
+        client.log_param(run.info.run_id, key, value)
+
+    # metric
+    for key, value in results.metrics.items():
+        client.log_metric(run.info.run_id, key, value)
+
+    # artifacts
+    filename = "results.pkl"
+    joblib.dump(results, filename)
+    for filename in glob.glob("./*"):
+        client.log_artifact(run.info.run_id, filename)
+
+    return results
+
+
+def premain(directory):
+    clear_work(directory)
+    os.chdir(directory)
+    if os.path.exists(str(globals().get("__file__"))):
+        shutil.copy(__file__, "work.py")
+
+
+# ====================================================
+# config
+# ====================================================
+CONFIG_STRING = """
+
+RUN_NAME: exp002
+RUN_DESC: baseline
+
+globals:
+  fold: null # indicate when training
+  seed: 42
+  n_fold: 5
+  work_dir: /workspaces/us-patent-phrase-to-phrase-matching/work
+  input_dir: ../input/us-patent-phrase-to-phrase-matching
+  input_cpc_dir: ../input/cpc-data
+  input_nltk_dir: ../input/nltk-downloads
+  device: cuda
+  use_amp: True
+  benchmark: False
+  deterministic: True
+  max_epochs: 5
+  debug: True
+
+mlflow:
+  save_dir: ../mlruns
+  experiment_name: experiments
+  save_results: True
+
+model_filename: {type: str_concat, ls: [model_, "@/model/encoder_name/", _fold, "@/globals/fold", .pth]}
+
+model:
+  type: Model
+  encoder_name:
+    type: get_encoder_name
+    path: "@/model/encoder_path"
+  encoder_path: bert-base-uncased
+  encoder_params:
+    hidden_dropout_prob: 0.10
+    attention_probs_dropout_prob: 0.10
+  head_type: SimpleHead
+  head_params:
+    out_features: 1
+    dropout_rate: 0.1 # SimpleHead, AttentionHead, AttentionMultiDropoutHead
+    # dropout_num: 5 # AttentionMultiDropoutHead
+    # hidden_features: 1024 # AttentionHead, AttentionMultiDropoutHead
+    # hidden_size: 256 # CNNHead
+    # kernel_size: 8 # CNNHead
+    # dropout: 0.10 # LSTMHead, GRUHead
+
+
+tokenizer:
+  type: Tokenizer
+  tokenizer_path: "@/model/encoder_path"
+  tokenizer_params: {}
+  max_length: 256
+
+
+dataset:
+  train:
+    type: Dataset
+    df: null  # set by lazy_init
+    tokenizer: "@/tokenizer"
+  valid:
+    type: Dataset
+    df: null  # set by lazy_init
+    tokenizer: "@/tokenizer"
+  test:
+    type: Dataset
+    df: null  # set by lazy_init
+    tokenizer: "@/tokenizer"
+
+
+dataloader:
+  train: 
+    type: DataLoader
+    dataset: "@/dataset/train"
+    batch_size: 32
+    num_workers: 2
+    shuffle: True
+    pin_memory: True
+    drop_last: True
+  valid: 
+    type: DataLoader
+    dataset: "@/dataset/valid"
+    batch_size: 32
+    num_workers: 2
+    shuffle: False
+    pin_memory: True
+    drop_last: False
+  test: 
+    type: DataLoader
+    dataset: "@/dataset/test"
+    batch_size: 32
+    num_workers: 2
+    shuffle: False
+    pin_memory: True
+    drop_last: False
+
+optimizer:
+  type: Adam # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
+  params: {type: method_call, obj: "@/model", method: parameters}
+  lr: 2.0e-05
+  # weight_decay: 5.0e-02
+  # momentum: 0.0
+  # weight_decay: 0.001 # AdamW, Lamb, RAdam
+  # betas: [0.9, 0.999] # Lamb, RAdam
+  # eps: 1.0e-07 # Lamb, RAdam
+  # adam: True # Lamb
+  # debias: False # Lamb
+  # rho: 0.05 # SAM
+  # adaptive: False # SAM
+  # base_optimizer: {type: getattr, obj: {type: eval, name: torch.optim}, name: Adam} # SAM
+
+scheduler:
+  type: OneCycleLR # [None, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]
+  optimizer: "@/optimizer"
+  # mode: min # ReduceLROnPlateau
+  # factor: 0.1 # ReduceLROnPlateau
+  # patience: 2 # ReduceLROnPlateau
+  # eps: 1.0e-08 # ReduceLROnPlateau
+  # T_max: {type: __len__, obj: "@/dataloader/train"} # CosineAnnealingLR
+  # T_0: {type: __len__, obj: "@/dataloader/train"} # CosineAnnealingWarmRestarts
+  # T_mult: 2 # CosineAnnealingWarmRestarts
+  # eta_min: 1.0e-12 # CosineAnnealingLR, CosineAnnealingWarmRestarts
+  
+  max_lr: 1.0e-04 # OneCycleLR
+  pct_start: 0.1 # OneCycleLR
+  steps_per_epoch: {type: __len__, obj: "@/dataloader/train"} # OneCycleLR
+  epochs: "@/globals/max_epochs" # OneCycleLR
+  anneal_strategy: cos # OneCycleLR
+  div_factor: 1.0e+02 # OneCycleLR
+  final_div_factor: 1 # OneCycleLR
+  
+  verbose: False
+
+loss: {type: MSELoss} # {MSELoss, BCELoss}
+
+metric: 
+  mse_loss: {type: MSEMetric, compute_on_step: False}
+  bce_loss: {type: BCEMetric, compute_on_step: False}
+  metric: {type: PearsonCorrCoef, compute_on_step: False}
+
+manager:
+  type: ExtensionsManager
+  models: "@/model"
+  optimizers: "@/optimizer"
+  max_epochs: "@/globals/max_epochs"
+  iters_per_epoch: {type: __len__, obj: "@/dataloader/train"}
+  out_dir: "@/globals/work_dir"
+
+extensions:
+  # snapshot
+  - extension: {type: snapshot, target: "@/model", n_retains: 1, filename: "@/model_filename"}
+    trigger: {type: MaxValueTrigger, key: "valid/metric", trigger: [1, epoch]}
+  # log
+  - extension: {type: observe_lr, optimizer: "@/optimizer"}
+    trigger: {type: IntervalTrigger, period: 1, unit: iteration}
+  - extension: {type: LogReport, filename: {type: str_concat, ls: [log_fold, "@/globals/fold"]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: lr, x_key: iteration, filename: {type: str_concat, ls: [lr_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: [train/mse_loss, valid/mse_loss], x_key: epoch, filename: {type: str_concat, ls: [mse_loss_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: [train/bce_loss, valid/bce_loss], x_key: epoch, filename: {type: str_concat, ls: [bce_loss_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: [train/metric, valid/metric], x_key: epoch, filename: {type: str_concat, ls: [metrics_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PrintReport, entries: [epoch, iteration, lr, loss, train/mse_loss, train/bce_loss, train/metric, valid/mse_loss, valid/bce_loss, valid/metric, elapsed_time]}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: ProgressBar, update_interval: 1}
+    trigger: {type: IntervalTrigger, period: 1, unit: iteration}
+#   # lr scheduler
+#   - extension: {type: LRScheduler, scheduler: "@/scheduler"}
+#     trigger: {type: IntervalTrigger, period: 1, unit: iteration}
+  # evaluator
+  - extension: {type: Evaluator, loader: "@/dataloader/train", prefix: "train/", model: "@/model", metrics: "@/metric", device: "@/globals/device"}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: Evaluator, loader: "@/dataloader/valid", prefix: "valid/", model: "@/model", metrics: "@/metric", device: "@/globals/device"}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+"""
+
+
+CONFIG_TYPES = {
+    # # utils
+    "__len__": lambda obj: len(obj),
+    "getattr": lambda obj, name: getattr(obj, name),
+    "eval": lambda name: eval(name),
+    "get_encoder_name": lambda path: path.split("/")[-1],
+    "str_concat": lambda ls: "".join([str(x) for x in ls]),
+    "method_call": lambda obj, method: getattr(obj, method)(),
+    # # Dataset, DataLoader
+    "Tokenizer": Tokenizer,
+    "Dataset": Dataset,
+    "DataLoader": torch.utils.data.DataLoader,
+    # # Model
+    "Model": Model,
+    "SimpleHead": SimpleHead,
+    "Attention": Attention,
+    "AttentionHead": AttentionHead,
+    "AttentionMultiDropoutHead": AttentionMultiDropoutHead,
+    "MeanPoolingHead": MeanPoolingHead,
+    "LSTMHead": LSTMHead,
+    "GRUHead": GRUHead,
+    "CNNHead": CNNHead,
+    # # Optimizer
+    "Adam": torch.optim.Adam,
+    "AdamW": torch.optim.AdamW,
+    "RAdam": torch.optim.RAdam,
+    "Lamb": Lamb,
+    "SAM": SAM,
+    # # Scheduler
+    "CosineAnnealingLR": torch.optim.lr_scheduler.CosineAnnealingLR,
+    "CosineAnnealingWarmRestarts": torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+    "OneCycleLR": torch.optim.lr_scheduler.OneCycleLR,
+    # # Loss
+    "BCELoss": torch.nn.BCELoss,
+    "MSELoss": torch.nn.MSELoss,
+    # # Metric
+    "MSEMetric": torchmetrics.MeanSquaredError,
+    "BCEMetric": BCEMetric,
+    "PearsonCorrCoef": torchmetrics.PearsonCorrCoef,
+    # # PPE Extensions
+    "ExtensionsManager": ppe.training.ExtensionsManager,
+    "observe_lr": ppe.training.extensions.observe_lr,
+    "LogReport": ppe.training.extensions.LogReport,
+    "PlotReport": ppe.training.extensions.PlotReport,
+    "PrintReport": ppe.training.extensions.PrintReport,
+    "ProgressBar": ppe.training.extensions.ProgressBar,
+    "snapshot": ppe.training.extensions.snapshot,
+    "LRScheduler": ppe.training.extensions.LRScheduler,
+    "MinValueTrigger": ppe.training.triggers.MinValueTrigger,
+    "MaxValueTrigger": ppe.training.triggers.MaxValueTrigger,
+    "EarlyStoppingTrigger": ppe.training.triggers.EarlyStoppingTrigger,
+    "IntervalTrigger": ppe.training.triggers.IntervalTrigger,
+    "Evaluator": Evaluator,
+}
+
+if __name__ == "__main__":
+
+    PRE_EVAL_CFG = yaml.safe_load(CONFIG_STRING)
+
+    # kaggle環境ならTrue
+    if "KAGGLE_URL_BASE" in os.environ.keys():
+        PRE_EVAL_CFG["globals"]["work_dir"] = "."
+        PRE_EVAL_CFG["mlflow"]["save_dir"] = "./mlruns"
+
+    # debug?
+    if PRE_EVAL_CFG["globals"]["debug"]:
+        PRE_EVAL_CFG["globals"]["max_epochs"] = 3
+        PRE_EVAL_CFG["globals"]["n_fold"] = 3
+        PRE_EVAL_CFG["mlflow"]["experiment_name"] = "debug"
+
+    premain("/workspaces/us-patent-phrase-to-phrase-matching/work")
+
+    results = Box(model_paths=[], metrics={})
+
+    training_main(PRE_EVAL_CFG, results)
+    inference_main(PRE_EVAL_CFG, results)
+
+    if PRE_EVAL_CFG["mlflow"]["save_results"]:
+        results = save_results_main(PRE_EVAL_CFG, results)
