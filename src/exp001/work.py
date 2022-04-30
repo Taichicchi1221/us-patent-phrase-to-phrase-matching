@@ -1,3 +1,4 @@
+from ctypes import Union
 import os
 import gc
 import re
@@ -448,58 +449,52 @@ class SAM(torch.optim.Optimizer):
 # dataset
 # ====================================================
 class Dataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        df=None,
-        tokenizer=None,
-    ):
-        self.df = df
-        self.tokenizer = tokenizer
-        if self.df is not None:
-            self.length = len(self.df)
+    def __init__(self, df=None, tokenizer=None, input_cpc_dir=None):
+        if df is not None:
+            self.anchors = df["anchor"].to_numpy()
+            self.targets = df["target"].to_numpy()
+            self.contexts = df["context"].to_numpy()
+            self.scores = df["score"].to_numpy()
+            self.length = len(df)
 
-    def __len__(
-        self,
-    ):
+        self.tokenizer = tokenizer
+
+        assert input_cpc_dir is not None
+        self.cpc_texts = get_cpc_texts(input_cpc_dir)
+
+    def __len__(self):
         return self.length
 
-    def lazy_init(
-        self,
-        df=None,
-        tokenizer=None,
-    ):
+    def lazy_init(self, df=None, tokenizer=None):
         """Reset Members"""
         if df is not None:
-            self.df = df
+            self.anchors = df["anchor"].to_numpy()
+            self.targets = df["target"].to_numpy()
+            self.contexts = df["context"].to_numpy()
+            self.scores = df["score"].to_numpy()
+            self.length = len(df)
+
         if tokenizer is not None:
             self.tokenizer = tokenizer
-        if self.df is not None:
-            self.length = len(self.df)
 
     def __getitem__(self, idx):
-        items = self.preprocess(self.df.iloc[idx])
+        items = self.preprocess(idx)
         return items
 
-    def preprocess(self, ser: pd.Series) -> dict:
+    def preprocess(self, idx: int):
         """preprocess input
 
         Args:
-            ser (pd.Series): self.df.iloc[idx]
+            idx (int): index
 
         Returns:
-            dict: dict of preprocessed items
+            tuple(dict, int): preprocessed inputs
         """
 
-        text = (
-            ser["anchor"]
-            + " "
-            + self.tokenizer.tokenizer.sep_token
-            + " "
-            + ser["target"]
-        )
+        text = f"{self.anchors[idx]} {self.tokenizer.tokenizer.sep_token} {self.targets[idx]}"
 
         encoded = self.tokenizer.encode(text)
-        score = ser["score"].astype("float32")
+        score = self.scores[idx].astype("float32")
 
         return (encoded, score)
 
@@ -788,7 +783,6 @@ def train_fold(CFG, fold):
     model = CFG["/model"]
     model.to(device)
     optimizer = CFG["/optimizer"]
-    scheduler = CFG["/schduler"]
     loss_func = CFG["/loss"]
     loss_func.to(device)
 
@@ -1019,7 +1013,7 @@ def premain(directory):
 CONFIG_STRING = """
 
 RUN_NAME: exp001
-RUN_DESC: baseline
+RUN_DESC: "baseline"
 
 globals:
   fold: null # indicate when training
@@ -1062,7 +1056,6 @@ model:
     # kernel_size: 8 # CNNHead
     # dropout: 0.10 # LSTMHead, GRUHead
 
-
 tokenizer:
   type: Tokenizer
   tokenizer_path: "@/model/encoder_path"
@@ -1075,14 +1068,17 @@ dataset:
     type: Dataset
     df: null  # set by lazy_init
     tokenizer: "@/tokenizer"
+    input_cpc_dir: "@/globals/input_cpc_dir"
   valid:
     type: Dataset
     df: null  # set by lazy_init
     tokenizer: "@/tokenizer"
+    input_cpc_dir: "@/globals/input_cpc_dir"
   test:
     type: Dataset
     df: null  # set by lazy_init
     tokenizer: "@/tokenizer"
+    input_cpc_dir: "@/globals/input_cpc_dir"
 
 
 dataloader:
