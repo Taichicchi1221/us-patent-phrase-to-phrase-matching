@@ -40,7 +40,6 @@ from sklearn.model_selection import (
     StratifiedKFold,
     StratifiedGroupKFold,
 )
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
 from sklearn.cluster import KMeans
 from sklearn.metrics import mean_squared_error
@@ -226,27 +225,13 @@ def get_cpc_texts(input_dir):
 
 
 def prepare_fold(df: pd.DataFrame, n_fold: int, seed: int):
-    dfx = (
-        pd.get_dummies(df, columns=["score"]).groupby(["anchor"], as_index=False).sum()
-    )
-    cols = [c for c in dfx.columns if c.startswith("score_") or c == "anchor"]
-    dfx = dfx[cols]
-
-    mskf = MultilabelStratifiedKFold(n_splits=n_fold, shuffle=True, random_state=seed)
-    labels = [c for c in dfx.columns if c != "anchor"]
-    dfx_labels = dfx[labels]
-    dfx["fold"] = -1
-
-    for fold, (trn_, val_) in enumerate(mskf.split(dfx, dfx_labels)):
-        dfx.loc[val_, "fold"] = fold
-
-    fold_array = df.merge(dfx[["anchor", "fold"]], on="anchor", how="left")[
-        "fold"
-    ].to_numpy()
+    skf = StratifiedGroupKFold(n_splits=n_fold, shuffle=True, random_state=seed)
+    fold_array = -np.ones(len(df), dtype=np.int64)
+    for fold, (train_idx, valid_idx) in enumerate(
+        skf.split(X=df, y=df["score"].apply(lambda x: int(4 * x)), groups=df["anchor"]),
+    ):
+        fold_array[valid_idx] = fold
     df["fold"] = fold_array
-
-    print("#" * 30, "folds", "#" * 30)
-    print(df["fold"].value_counts())
 
 
 # ====================================================
@@ -939,36 +924,6 @@ class Model(nn.Module):
         return output.view(-1)
 
 
-def get_optimizer_params(model, encoder_lr, head_lr, weight_decay=0.0):
-    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-    optimizer_parameters = [
-        {
-            "params": [
-                p
-                for n, p in model.encoder.named_parameters()
-                if not any(nd in n for nd in no_decay)
-            ],
-            "lr": encoder_lr,
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [
-                p
-                for n, p in model.encoder.named_parameters()
-                if any(nd in n for nd in no_decay)
-            ],
-            "lr": encoder_lr,
-            "weight_decay": 0.0,
-        },
-        {
-            "params": [p for n, p in model.head.named_parameters()],
-            "lr": head_lr,
-            "weight_decay": 0.0,
-        },
-    ]
-    return optimizer_parameters
-
-
 # ====================================================
 # train fold
 # ====================================================
@@ -1206,8 +1161,8 @@ def premain(directory):
 # ====================================================
 CONFIG_STRING = """
 
-RUN_NAME: exp004
-RUN_DESC: "deberta-v3-large 1"
+RUN_NAME: exp003
+RUN_DESC: "baseline + NonDropout"
 
 globals:
   fold: null # indicate when training
@@ -1218,14 +1173,14 @@ globals:
   input_cpc_dir: ../input/cpc-data
   input_nltk_dir: ../input/nltk-downloads
   input_huggingface_dir: ../input/huggingface-models
-  debug: False
+  debug: True
 
 training:
   device: cuda
   use_amp: True
   benchmark: False
   deterministic: True
-  max_epochs: 5
+  max_epochs: 10
   accumulate_gradient_batchs: 1
   steps_per_epoch: {type: integer_div_ceil, x: {type: __len__, obj: "@/dataloader/train"}, y: "@/training/accumulate_gradient_batchs"}
 
@@ -1241,14 +1196,14 @@ model:
   encoder_name:
     type: get_encoder_name
     path: "@/model/encoder_path"
-  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "microsoft/deberta-v3-large"]}
+  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "anferico/bert-for-patents"]}
   encoder_params:
     hidden_dropout_prob: 0.20
     attention_probs_dropout_prob: 0.20
   head_type: SimpleHead
   head_params:
     out_features: 1
-    dropout_rate: 0.10 # SimpleHead
+    dropout_rate: 0.20 # SimpleHead
     # hidden_features: 1024 # AttentionHead, MaskAddedAttentionHead
     # hidden_size: 256 # CNNHead
     # kernel_size: 8 # CNNHead
@@ -1293,7 +1248,7 @@ dataloader:
     batch_size: 16
     num_workers: 2
     shuffle: False
-    pin_memory: False
+    pin_memory: True
     drop_last: False
   test: 
     type: DataLoader
@@ -1305,13 +1260,10 @@ dataloader:
     drop_last: False
 
 optimizer:
-  type: AdamW # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
-  params:
-    type: get_optimizer_params
-    model: "@/model"
-    encoder_lr: 2.0e-05
-    head_lr:    2.0e-05
-    weight_decay: 0.01
+  type: Adam # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
+  params: {type: method_call, obj: "@/model", method: parameters}
+  lr: 1.0e-05
+  # weight_decay: 5.0e-02
   # momentum: 0.0
   # weight_decay: 0.001 # AdamW, Lamb, RAdam
   # betas: [0.9, 0.999] # Lamb, RAdam
@@ -1412,7 +1364,6 @@ CONFIG_TYPES = {
     "LSTMHead": LSTMHead,
     "GRUHead": GRUHead,
     "CNNHead": CNNHead,
-    "get_optimizer_params": get_optimizer_params,
     # # Optimizer
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,

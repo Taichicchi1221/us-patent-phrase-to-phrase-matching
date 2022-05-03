@@ -34,13 +34,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.model_selection import (
-    GroupKFold,
-    KFold,
-    StratifiedKFold,
-    StratifiedGroupKFold,
-)
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
 
 from sklearn.cluster import KMeans
 from sklearn.metrics import mean_squared_error
@@ -226,27 +220,13 @@ def get_cpc_texts(input_dir):
 
 
 def prepare_fold(df: pd.DataFrame, n_fold: int, seed: int):
-    dfx = (
-        pd.get_dummies(df, columns=["score"]).groupby(["anchor"], as_index=False).sum()
-    )
-    cols = [c for c in dfx.columns if c.startswith("score_") or c == "anchor"]
-    dfx = dfx[cols]
-
-    mskf = MultilabelStratifiedKFold(n_splits=n_fold, shuffle=True, random_state=seed)
-    labels = [c for c in dfx.columns if c != "anchor"]
-    dfx_labels = dfx[labels]
-    dfx["fold"] = -1
-
-    for fold, (trn_, val_) in enumerate(mskf.split(dfx, dfx_labels)):
-        dfx.loc[val_, "fold"] = fold
-
-    fold_array = df.merge(dfx[["anchor", "fold"]], on="anchor", how="left")[
-        "fold"
-    ].to_numpy()
+    skf = StratifiedKFold(n_splits=n_fold, shuffle=True, random_state=seed)
+    fold_array = -np.ones(len(df), dtype=np.int64)
+    for fold, (train_idx, valid_idx) in enumerate(
+        skf.split(df, df["score"].astype(str))
+    ):
+        fold_array[valid_idx] = fold
     df["fold"] = fold_array
-
-    print("#" * 30, "folds", "#" * 30)
-    print(df["fold"].value_counts())
 
 
 # ====================================================
@@ -779,33 +759,82 @@ class SimpleHead(nn.Module):
         return output
 
 
-class AttentionHead(nn.Module):
-    def __init__(self, in_features, hidden_features, out_features):
-        super(AttentionHead, self).__init__()
-        self.W = nn.Linear(in_features, hidden_features)
-        self.V = nn.Linear(hidden_features, out_features)
+class Attention(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+    ):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(in_features, hidden_features),
+            nn.Tanh(),
+            nn.Linear(hidden_features, 1),
+            nn.Softmax(dim=1),
+        )
 
     def forward(self, x):
-        attention_scores = self.V(torch.tanh(self.W(x)))
-        attention_scores = torch.softmax(attention_scores, dim=1)
-        attentive_x = attention_scores * x
-        attentive_x = attentive_x.sum(axis=1)
-        return attentive_x
+        weights = self.attention(x)
+        output = torch.sum(weights * x, dim=1).squeeze(-1)
+        return output
 
 
-class MaskAddedAttentionHead(nn.Module):
-    def __init__(self, in_features, hidden_features, out_features):
-        super(MaskAddedAttentionHead, self).__init__()
-        self.W = nn.Linear(in_features, hidden_features)
-        self.V = nn.Linear(hidden_features, out_features)
+class AttentionHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        out_features,
+        dropout_rate=0.5,
+    ):
+        super().__init__()
 
-    def forward(self, x, attention_mask):
-        attention_scores = self.V(torch.tanh(self.W(x)))
-        attention_scores = attention_scores + attention_mask
-        attention_scores = torch.softmax(attention_scores, dim=1)
-        attentive_x = attention_scores * x
-        attentive_x = attentive_x.sum(axis=1)
-        return attentive_x
+        self.attention = Attention(in_features, hidden_features)
+        self.layer_norm = nn.LayerNorm(in_features)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        x = self.attention(x)
+        x = self.layer_norm(x)
+        x = self.dropout(x)
+        output = self.linear(x)
+        return output
+
+
+class AttentionMultiDropoutHead(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features,
+        dropout_num=5,
+        dropout_rate=0.5,
+    ):
+        super().__init__()
+
+        self.attention = Attention(in_features, hidden_features)
+        self.layer_norm = nn.LayerNorm(in_features)
+        self.dropouts = nn.ModuleList(
+            [nn.Dropout(dropout_rate) for _ in range(dropout_num)]
+        )
+        self.linears = nn.ModuleList(
+            [nn.Linear(in_features, 1) for _ in range(dropout_num)]
+        )
+
+    def forward(self, x):
+        x = self.attention(x)
+        x = self.layer_norm(x)
+        output = torch.mean(
+            torch.cat(
+                [
+                    linear(dropout(x))
+                    for dropout, linear in zip(self.dropouts, self.linears)
+                ],
+                -1,
+            ),
+            -1,
+        )
+        return output
 
 
 class MeanPoolingHead(nn.Module):
@@ -939,36 +968,6 @@ class Model(nn.Module):
         return output.view(-1)
 
 
-def get_optimizer_params(model, encoder_lr, head_lr, weight_decay=0.0):
-    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-    optimizer_parameters = [
-        {
-            "params": [
-                p
-                for n, p in model.encoder.named_parameters()
-                if not any(nd in n for nd in no_decay)
-            ],
-            "lr": encoder_lr,
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [
-                p
-                for n, p in model.encoder.named_parameters()
-                if any(nd in n for nd in no_decay)
-            ],
-            "lr": encoder_lr,
-            "weight_decay": 0.0,
-        },
-        {
-            "params": [p for n, p in model.head.named_parameters()],
-            "lr": head_lr,
-            "weight_decay": 0.0,
-        },
-    ]
-    return optimizer_parameters
-
-
 # ====================================================
 # train fold
 # ====================================================
@@ -1062,6 +1061,7 @@ def inference(stage, model_path, CFG):
 # main
 # ====================================================
 def training_main(PRE_EVAL_CFG, results):
+
     train_df = pd.read_csv(Path(PRE_EVAL_CFG["globals"]["input_dir"], "train.csv"))
 
     # debug?
@@ -1206,8 +1206,8 @@ def premain(directory):
 # ====================================================
 CONFIG_STRING = """
 
-RUN_NAME: exp004
-RUN_DESC: "deberta-v3-large 1"
+RUN_NAME: exp002
+RUN_DESC: "baseline, BCELoss"
 
 globals:
   fold: null # indicate when training
@@ -1225,7 +1225,7 @@ training:
   use_amp: True
   benchmark: False
   deterministic: True
-  max_epochs: 5
+  max_epochs: 10
   accumulate_gradient_batchs: 1
   steps_per_epoch: {type: integer_div_ceil, x: {type: __len__, obj: "@/dataloader/train"}, y: "@/training/accumulate_gradient_batchs"}
 
@@ -1241,15 +1241,16 @@ model:
   encoder_name:
     type: get_encoder_name
     path: "@/model/encoder_path"
-  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "microsoft/deberta-v3-large"]}
+  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "roberta-base"]}
   encoder_params:
-    hidden_dropout_prob: 0.20
-    attention_probs_dropout_prob: 0.20
+    hidden_dropout_prob: 0.10
+    attention_probs_dropout_prob: 0.10
   head_type: SimpleHead
   head_params:
     out_features: 1
-    dropout_rate: 0.10 # SimpleHead
-    # hidden_features: 1024 # AttentionHead, MaskAddedAttentionHead
+    dropout_rate: 0.1 # SimpleHead, AttentionHead, AttentionMultiDropoutHead
+    # dropout_num: 5 # AttentionMultiDropoutHead
+    # hidden_features: 1024 # AttentionHead, AttentionMultiDropoutHead
     # hidden_size: 256 # CNNHead
     # kernel_size: 8 # CNNHead
     # dropout: 0.10 # LSTMHead, GRUHead
@@ -1258,7 +1259,7 @@ tokenizer:
   type: Tokenizer
   tokenizer_path: "@/model/encoder_path"
   tokenizer_params: {}
-  max_length: 150
+  max_length: 256
 
 dataset:
   train:
@@ -1282,7 +1283,7 @@ dataloader:
   train: 
     type: DataLoader
     dataset: "@/dataset/train"
-    batch_size: 16
+    batch_size: 64
     num_workers: 2
     shuffle: True
     pin_memory: True
@@ -1290,10 +1291,10 @@ dataloader:
   valid: 
     type: DataLoader
     dataset: "@/dataset/valid"
-    batch_size: 16
+    batch_size: 64
     num_workers: 2
     shuffle: False
-    pin_memory: False
+    pin_memory: True
     drop_last: False
   test: 
     type: DataLoader
@@ -1305,13 +1306,10 @@ dataloader:
     drop_last: False
 
 optimizer:
-  type: AdamW # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
-  params:
-    type: get_optimizer_params
-    model: "@/model"
-    encoder_lr: 2.0e-05
-    head_lr:    2.0e-05
-    weight_decay: 0.01
+  type: Adam # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
+  params: {type: method_call, obj: "@/model", method: parameters}
+  lr: 1.0e-05
+  # weight_decay: 5.0e-02
   # momentum: 0.0
   # weight_decay: 0.001 # AdamW, Lamb, RAdam
   # betas: [0.9, 0.999] # Lamb, RAdam
@@ -1344,7 +1342,7 @@ scheduler:
   
   verbose: False
 
-loss: {type: MSEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
+loss: {type: BCEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
 
 metric: 
   mse_loss: {type: MSEWithLogitsMetric, compute_on_step: False}
@@ -1406,13 +1404,13 @@ CONFIG_TYPES = {
     # # Model
     "Model": Model,
     "SimpleHead": SimpleHead,
+    "Attention": Attention,
     "AttentionHead": AttentionHead,
-    "MaskAddedAttentionHead": MaskAddedAttentionHead,
+    "AttentionMultiDropoutHead": AttentionMultiDropoutHead,
     "MeanPoolingHead": MeanPoolingHead,
     "LSTMHead": LSTMHead,
     "GRUHead": GRUHead,
     "CNNHead": CNNHead,
-    "get_optimizer_params": get_optimizer_params,
     # # Optimizer
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,

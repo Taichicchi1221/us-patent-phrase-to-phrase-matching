@@ -19,6 +19,7 @@ from collections.abc import MutableMapping, Iterable
 from abc import ABC, ABCMeta, abstractmethod
 
 import json
+import scipy
 import yaml
 
 from tqdm.auto import tqdm
@@ -62,6 +63,14 @@ tqdm.pandas()
 # ====================================================
 # utils
 # ====================================================
+def sigmoid(signal):
+    # Prevent overflow.
+    signal = np.clip(signal, -500, 500)
+
+    # Calculate activation signal
+    signal = 1.0 / (1 + np.exp(-signal))
+
+    return signal
 
 
 def flatten_dict(
@@ -159,14 +168,16 @@ class Evaluator(ppe.training.extension.Extension):
 
     def __call__(self, manager):
         self.model.eval()
+        for name in self.metrics.keys():
+            self.metrics[name].reset()
+
         with torch.no_grad():
             for batch in self.loader:
                 x, y = batch
                 for k in x.keys():
                     x[k] = x[k].to(self.device)
-                y = y.to(self.device)
 
-                yhat = self.model(x).detach().cpu().float()
+                yhat = self.model(x).detach().cpu()
 
                 for name, metric in self.metrics.items():
                     metric.update(yhat, y.detach().cpu())
@@ -221,34 +232,91 @@ def prepare_fold(df: pd.DataFrame, n_fold: int, seed: int):
 # ====================================================
 # loss
 # ====================================================
+class MSEWithLogitsLoss(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, inputs, targets):
+        # comment out if your model contains a sigmoid or equivalent activation layer
+        inputs = torch.sigmoid(inputs)
+
+        # flatten label and prediction tensors
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
+
+        loss = F.mse_loss(inputs, targets)
+
+        return loss
 
 
 # ====================================================
 # metrics
 # ====================================================
 class BCEMetric(torchmetrics.Metric):
-    def __init__(
-        self,
-        compute_on_step: bool = True,
-        dist_sync_on_step: bool = False,
-        process_group: typing.Optional[typing.Any] = None,
-        dist_sync_fn: typing.Callable = None,
-    ) -> None:
-        super().__init__(
-            compute_on_step=compute_on_step,
-            dist_sync_on_step=dist_sync_on_step,
-            process_group=process_group,
-            dist_sync_fn=dist_sync_fn,
-        )
+    def __init__(self, compute_on_step: bool = True) -> None:
+        super().__init__(compute_on_step=compute_on_step)
         self.value = 0
         self.l = 0
 
     def update(self, yhat, y):
+        yhat = yhat.view(-1)
+        y = y.view(-1)
         self.value += F.binary_cross_entropy(yhat, y, reduction="sum")
-        self.l += 1
+        self.l += int(y.size()[0])
 
     def compute(self):
         return self.value / self.l
+
+
+class BCEWithLogitsMetric(torchmetrics.Metric):
+    def __init__(self, compute_on_step: bool = True) -> None:
+        super().__init__(compute_on_step=compute_on_step)
+        self.value = 0
+        self.l = 0
+
+    def update(self, yhat, y):
+        yhat = yhat.view(-1)
+        y = y.view(-1)
+        self.value += F.binary_cross_entropy_with_logits(yhat, y, reduction="sum")
+        self.l += int(y.size()[0])
+
+    def compute(self):
+        return self.value / self.l
+
+
+class MSEWithLogitsMetric(torchmetrics.Metric):
+    def __init__(self, compute_on_step: bool = True) -> None:
+        super().__init__(compute_on_step=compute_on_step)
+        self.value = 0
+        self.l = 0
+
+    def update(self, yhat, y):
+        yhat = yhat.view(-1)
+        y = y.view(-1)
+
+        yhat = torch.sigmoid(yhat)
+
+        self.value += F.mse_loss(yhat, y, reduction="sum")
+        self.l += int(y.size()[0])
+
+    def compute(self):
+        return self.value / self.l
+
+
+class PearsonCorrCoefWithLogitsMetric(torchmetrics.PearsonCorrCoef):
+    def __init__(self, compute_on_step: bool = True) -> None:
+        super().__init__(compute_on_step=compute_on_step)
+
+    def update(self, yhat, y):
+        yhat = yhat.view(-1)
+        y = y.view(-1)
+
+        yhat = torch.sigmoid(yhat)
+
+        super().update(yhat, y)
+
+    def compute(self):
+        return super().compute()
 
 
 # ====================================================
@@ -660,7 +728,7 @@ class Tokenizer(object):
             padding="max_length",
             pad_to_max_length=True,
             max_length=self.max_length,
-            return_token_type_ids=True,
+            return_token_type_ids=False,
             return_attention_mask=True,
             return_tensors="pt",
         )
@@ -897,7 +965,7 @@ class Model(nn.Module):
             output = self.head(last_hidden_state, x["attention_mask"])
         else:
             output = self.head(last_hidden_state)
-        return torch.sigmoid(output.view(-1))
+        return output.view(-1)
 
 
 # ====================================================
@@ -906,20 +974,23 @@ class Model(nn.Module):
 def train_fold(CFG, fold):
     print("#" * 30, f"fold: {fold}", "#" * 30)
 
-    torch.backends.cudnn.benchmark = CFG["/globals/benchmark"]
-    seed_everything(CFG["/globals/seed"], deterministic=CFG["/globals/deterministic"])
-    device = torch.device(CFG["/globals/device"])
+    torch.backends.cudnn.benchmark = CFG["/training/benchmark"]
+    seed_everything(CFG["/globals/seed"], deterministic=CFG["/training/deterministic"])
+    device = torch.device(CFG["/training/device"])
+
+    accumulation_steps = CFG["/training/accumulate_gradient_batchs"]
 
     train_dataloader = CFG["/dataloader/train"]
     valid_dataloader = CFG["/dataloader/valid"]
 
     model = CFG["/model"]
     model.to(device)
+    model.train()
     optimizer = CFG["/optimizer"]
+    scheduler = CFG["/scheduler"]
     loss_func = CFG["/loss"]
-    loss_func.to(device)
 
-    use_amp = CFG["/globals/use_amp"]
+    use_amp = CFG["/training/use_amp"]
     scaler = amp.GradScaler(enabled=use_amp)
 
     manager = CFG["/manager"]
@@ -928,20 +999,27 @@ def train_fold(CFG, fold):
 
     while not manager.stop_trigger:
         model.train()
-        for batch in train_dataloader:
+        for batch_idx, batch in enumerate(train_dataloader):
             with manager.run_iteration():
                 x, y = batch
                 for k in x.keys():
                     x[k] = x[k].to(device)
                 y = y.to(device)
 
-                optimizer.zero_grad()
                 with amp.autocast(use_amp):
                     yhat = model(x)
+
                     loss = loss_func(yhat, y)
+                    if accumulation_steps > 1:
+                        loss = loss / accumulation_steps
+
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
 
                 ppe.reporting.report({"loss": loss.item()})
 
@@ -957,7 +1035,7 @@ def inference(stage, model_path, CFG):
     dataloader = CFG[f"/dataloader/{stage}"]
 
     model = CFG["/model"]
-    device = CFG["/globals/device"]
+    device = CFG["/training/device"]
     model.load_state_dict(torch.load(model_path))
     model.to(device)
     model.eval()
@@ -989,7 +1067,8 @@ def training_main(PRE_EVAL_CFG, results):
     # debug?
     if PRE_EVAL_CFG["globals"]["debug"]:
         train_df = train_df.sample(
-            1000, random_state=PRE_EVAL_CFG["globals"]["seed"]
+            n=1000,
+            random_state=PRE_EVAL_CFG["globals"]["seed"],
         ).reset_index(drop=True)
 
     print(f"train length = {len(train_df)}")
@@ -1002,13 +1081,7 @@ def training_main(PRE_EVAL_CFG, results):
     )
 
     # prepare
-    oof_df = pd.DataFrame(
-        {
-            "id": train_df["id"],
-            "count": np.zeros(len(train_df)),
-            "score": np.zeros(len(train_df)),
-        }
-    )
+    oof_df = pd.DataFrame({"id": train_df["id"], "score": np.zeros(len(train_df))})
     for fold in range(PRE_EVAL_CFG["globals"]["n_fold"]):
         train_idx = train_df.loc[train_df["fold"] != fold].index
         valid_idx = train_df.loc[train_df["fold"] == fold].index
@@ -1024,44 +1097,35 @@ def training_main(PRE_EVAL_CFG, results):
         train_fold(CFG=CFG, fold=fold)
 
         oof_prediction = inference(stage="valid", model_path=model_path, CFG=CFG)
-        oof_df.loc[valid_idx, "count"] += 1
-        oof_df.loc[valid_idx, "score"] += oof_prediction
+        oof_df.loc[valid_idx, "score"] = oof_prediction
 
         torch.cuda.empty_cache()
         gc.collect()
 
         results.model_paths.append(model_path)
 
-    oof_df["score"] = oof_df["score"] / oof_df["count"]
-    oof_df.drop(columns="count", inplace=True)
     oof_df.to_csv("oof.csv", index=False)
 
     metric = CFG["/metric/metric"]
-    metric(
-        torch.tensor(train_df["score"]).float(),
-        torch.tensor(oof_df["score"]).float(),
-    )
+    metric.reset()
+    metric(torch.tensor(oof_df["score"]), torch.tensor(train_df["score"]))
     validation_score = float(metric.compute().detach().cpu().numpy())
 
     print(f"validation score: {validation_score}")
     results.metrics.update({"valid_score": validation_score})
 
     # plots
-    plot_dist(train_df["score"], oof_df["score"], filename="oof_dist_plot.png")
-    plot_scatter(train_df["score"], oof_df["score"], filename="oof_scatter_plot.png")
+    plot_dist(train_df["score"], sigmoid(oof_df["score"]), filename="oof_dist_plot.png")
+    plot_scatter(
+        train_df["score"], sigmoid(oof_df["score"]), filename="oof_scatter_plot.png"
+    )
 
 
 def inference_main(PRE_EVAL_CFG, results):
     test_df = pd.read_csv(Path(PRE_EVAL_CFG["globals"]["input_dir"], "test.csv"))
     test_df["score"] = 0
 
-    submission_df = pd.DataFrame(
-        {
-            "id": test_df["id"],
-            "count": np.zeros(len(test_df)),
-            "score": np.zeros(len(test_df)),
-        }
-    )
+    submission_df = pd.DataFrame({"id": test_df["id"], "score": np.zeros(len(test_df))})
 
     for fold, model_path in enumerate(results.model_paths):
         print("#" * 30, f"fold: {fold}", "#" * 30)
@@ -1072,11 +1136,9 @@ def inference_main(PRE_EVAL_CFG, results):
         CFG["/dataset/test"].lazy_init(df=test_df)
 
         test_prediction = inference(stage="test", model_path=model_path, CFG=CFG)
-        submission_df["count"] += 1
         submission_df["score"] += test_prediction
 
-    submission_df["score"] = submission_df["score"] / submission_df["count"]
-    submission_df.drop(columns="count", inplace=True)
+    submission_df["score"] /= len(results.model_paths)
     submission_df.to_csv("submission.csv", index=False)
     results.metrics.update({"public_lb": np.nan})
     results.metrics.update({"private_lb": np.nan})
@@ -1156,12 +1218,16 @@ globals:
   input_cpc_dir: ../input/cpc-data
   input_nltk_dir: ../input/nltk-downloads
   input_huggingface_dir: ../input/huggingface-models
+  debug: False
+
+training:
   device: cuda
   use_amp: True
   benchmark: False
   deterministic: True
-  max_epochs: 5
-  debug: False
+  max_epochs: 10
+  accumulate_gradient_batchs: 1
+  steps_per_epoch: {type: integer_div_ceil, x: {type: __len__, obj: "@/dataloader/train"}, y: "@/training/accumulate_gradient_batchs"}
 
 mlflow:
   save_dir: ../mlruns
@@ -1217,7 +1283,7 @@ dataloader:
   train: 
     type: DataLoader
     dataset: "@/dataset/train"
-    batch_size: 32
+    batch_size: 64
     num_workers: 2
     shuffle: True
     pin_memory: True
@@ -1225,7 +1291,7 @@ dataloader:
   valid: 
     type: DataLoader
     dataset: "@/dataset/valid"
-    batch_size: 32
+    batch_size: 64
     num_workers: 2
     shuffle: False
     pin_memory: True
@@ -1233,10 +1299,10 @@ dataloader:
   test: 
     type: DataLoader
     dataset: "@/dataset/test"
-    batch_size: 32
-    num_workers: 2
+    batch_size: 16
+    num_workers: 1
     shuffle: False
-    pin_memory: True
+    pin_memory: False
     drop_last: False
 
 optimizer:
@@ -1268,26 +1334,26 @@ scheduler:
   
   max_lr: 5.0e-05 # OneCycleLR
   pct_start: 0.1 # OneCycleLR
-  steps_per_epoch: {type: __len__, obj: "@/dataloader/train"} # OneCycleLR
-  epochs: "@/globals/max_epochs" # OneCycleLR
+  steps_per_epoch: "@/training/steps_per_epoch" # OneCycleLR
+  epochs: "@/training/max_epochs" # OneCycleLR
   anneal_strategy: cos # OneCycleLR
   div_factor: 1.0e+02 # OneCycleLR
   final_div_factor: 1 # OneCycleLR
   
   verbose: False
 
-loss: {type: MSELoss} # {MSELoss, BCELoss}
+loss: {type: MSEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
 
 metric: 
-  mse_loss: {type: MSEMetric, compute_on_step: False}
-  bce_loss: {type: BCEMetric, compute_on_step: False}
-  metric: {type: PearsonCorrCoef, compute_on_step: False}
+  mse_loss: {type: MSEWithLogitsMetric, compute_on_step: False}
+  bce_loss: {type: BCEWithLogitsMetric, compute_on_step: False}
+  metric: {type: PearsonCorrCoefWithLogitsMetric, compute_on_step: False}
 
 manager:
   type: ExtensionsManager
   models: "@/model"
   optimizers: "@/optimizer"
-  max_epochs: "@/globals/max_epochs"
+  max_epochs: "@/training/max_epochs"
   iters_per_epoch: {type: __len__, obj: "@/dataloader/train"}
   out_dir: "@/globals/work_dir"
 
@@ -1312,13 +1378,10 @@ extensions:
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
   - extension: {type: ProgressBar, update_interval: 1}
     trigger: {type: IntervalTrigger, period: 1, unit: iteration}
-  # lr scheduler
-  - extension: {type: LRScheduler, scheduler: "@/scheduler"}
-    trigger: {type: IntervalTrigger, period: 1, unit: iteration}
   # evaluator
-  - extension: {type: Evaluator, loader: "@/dataloader/train", prefix: "train/", model: "@/model", metrics: "@/metric", device: "@/globals/device"}
+  - extension: {type: Evaluator, loader: "@/dataloader/train", prefix: "train/", model: "@/model", metrics: "@/metric", device: "@/training/device"}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
-  - extension: {type: Evaluator, loader: "@/dataloader/valid", prefix: "valid/", model: "@/model", metrics: "@/metric", device: "@/globals/device"}
+  - extension: {type: Evaluator, loader: "@/dataloader/valid", prefix: "valid/", model: "@/model", metrics: "@/metric", device: "@/training/device"}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
 """
 
@@ -1332,6 +1395,8 @@ CONFIG_TYPES = {
     "str_concat": lambda ls: "".join([str(x) for x in ls]),
     "method_call": lambda obj, method: getattr(obj, method)(),
     "path_join": lambda ls: os.path.join(*ls),
+    "integer_div": lambda x, y: x // y,
+    "integer_div_ceil": lambda x, y: (x + y - 1) // y,
     # # Dataset, DataLoader
     "Tokenizer": Tokenizer,
     "Dataset": Dataset,
@@ -1359,9 +1424,14 @@ CONFIG_TYPES = {
     # # Loss
     "BCELoss": torch.nn.BCELoss,
     "MSELoss": torch.nn.MSELoss,
+    "BCEWithLogitsLoss": torch.nn.BCEWithLogitsLoss,
+    "MSEWithLogitsLoss": MSEWithLogitsLoss,
     # # Metric
-    "MSEMetric": torchmetrics.MeanSquaredError,
+    "BCEWithLogitsMetric": BCEWithLogitsMetric,
+    "MSEWithLogitsMetric": MSEWithLogitsMetric,
+    "PearsonCorrCoefWithLogitsMetric": PearsonCorrCoefWithLogitsMetric,
     "BCEMetric": BCEMetric,
+    "MSEMetric": torchmetrics.MeanSquaredError,
     "PearsonCorrCoef": torchmetrics.PearsonCorrCoef,
     # # PPE Extensions
     "ExtensionsManager": ppe.training.ExtensionsManager,
@@ -1390,8 +1460,8 @@ if __name__ == "__main__":
 
     # debug?
     if PRE_EVAL_CFG["globals"]["debug"]:
-        PRE_EVAL_CFG["globals"]["max_epochs"] = 3
         PRE_EVAL_CFG["globals"]["n_fold"] = 3
+        PRE_EVAL_CFG["training"]["max_epochs"] = 3
         PRE_EVAL_CFG["mlflow"]["experiment_name"] = "debug"
 
     premain("/workspaces/us-patent-phrase-to-phrase-matching/work")
