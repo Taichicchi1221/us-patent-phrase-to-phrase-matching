@@ -1206,8 +1206,8 @@ def premain(directory):
 # ====================================================
 CONFIG_STRING = """
 
-RUN_NAME: exp006
-RUN_DESC: "bert-for-patents"
+RUN_NAME: exp005
+RUN_DESC: "deberta-v3-large 2"
 
 globals:
   fold: null # indicate when training
@@ -1241,7 +1241,7 @@ model:
   encoder_name:
     type: get_encoder_name
     path: "@/model/encoder_path"
-  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "anferico/bert-for-patents"]}
+  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "microsoft/deberta-v3-large"]}
   encoder_params:
     hidden_dropout_prob: 0.10
     attention_probs_dropout_prob: 0.10
@@ -1344,7 +1344,7 @@ scheduler:
   
   verbose: False
 
-loss: {type: MSEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
+loss: {type: BCEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
 
 metric: 
   mse_loss: {type: MSEWithLogitsMetric, compute_on_step: False}

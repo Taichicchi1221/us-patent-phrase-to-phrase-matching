@@ -1206,8 +1206,8 @@ def premain(directory):
 # ====================================================
 CONFIG_STRING = """
 
-RUN_NAME: exp006
-RUN_DESC: "bert-for-patents"
+RUN_NAME: exp004
+RUN_DESC: "deberta-v3-large 1"
 
 globals:
   fold: null # indicate when training
@@ -1226,7 +1226,7 @@ training:
   benchmark: False
   deterministic: True
   max_epochs: 5
-  accumulate_gradient_batchs: 16
+  accumulate_gradient_batchs: 8
   steps_per_epoch: {type: integer_div_ceil, x: {type: __len__, obj: "@/dataloader/train"}, y: "@/training/accumulate_gradient_batchs"}
 
 mlflow:
@@ -1241,7 +1241,7 @@ model:
   encoder_name:
     type: get_encoder_name
     path: "@/model/encoder_path"
-  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "anferico/bert-for-patents"]}
+  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "microsoft/deberta-v3-large"]}
   encoder_params:
     hidden_dropout_prob: 0.10
     attention_probs_dropout_prob: 0.10

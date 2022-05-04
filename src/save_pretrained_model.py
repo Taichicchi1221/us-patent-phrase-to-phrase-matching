@@ -1,7 +1,7 @@
 import os
 import transformers
 
-MODEL_NAME = "anferico/bert-for-patents"
+MODEL_NAME = "AI-Growth-Lab/PatentSBERTa"
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
 model = transformers.AutoModel.from_pretrained(MODEL_NAME)
