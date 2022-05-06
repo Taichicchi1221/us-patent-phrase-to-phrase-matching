@@ -250,6 +250,39 @@ def prepare_fold(df: pd.DataFrame, n_fold: int, seed: int):
     print(df["fold"].value_counts())
 
 
+class Preprocessor(object):
+    def __init__(self, input_nltk_dir) -> None:
+        if input_nltk_dir not in nltk.data.path:
+            nltk.data.path.append(input_nltk_dir)
+
+        self.stop_words = set(nltk.corpus.stopwords.words("english"))
+
+    @staticmethod
+    def untokenize(words):
+        # from https://github.com/commonsense/metanl/blob/master/metanl/token_utils.py
+        """
+        Untokenizing a text undoes the tokenizing operation, restoring
+        punctuation and spaces to the places that people expect them to be.
+        Ideally, `untokenize(tokenize(text))` should be identical to `text`,
+        except for line breaks.
+        """
+        text = " ".join(words)
+        step1 = text.replace("`` ", '"').replace(" ''", '"').replace(". . .", "...")
+        step2 = step1.replace(" ( ", " (").replace(" ) ", ") ")
+        step3 = re.sub(r' ([.,:;?!%]+)([ \'"`])', r"\1\2", step2)
+        step4 = re.sub(r" ([.,:;?!%]+)$", r"\1", step3)
+        step5 = (
+            step4.replace(" '", "'").replace(" n't", "n't").replace("can not", "cannot")
+        )
+        step6 = step5.replace(" ` ", " '")
+        return step6.strip()
+
+    def __call__(self, text):
+        tokens = nltk.word_tokenize(text)
+        text = [t.lower() for t in tokens if t.lower() not in self.stop_words]
+        return self.untokenize(text)
+
+
 # ====================================================
 # loss
 # ====================================================
@@ -724,46 +757,18 @@ class Dataset(torch.utils.data.Dataset):
 
         return (encoded, score)
 
+    @classmethod
+    def postprocess(cls, d: dict):
+        """postprocess
 
-class Preprocessor(object):
-    def __init__(self, input_nltk_dir) -> None:
-        if input_nltk_dir not in nltk.data.path:
-            nltk.data.path.append(input_nltk_dir)
+        Args:
+            d (dict): _description_
 
-        self.stop_words = set(nltk.corpus.stopwords.words("english"))
-
-    @staticmethod
-    def untokenize(words):
-        # from https://github.com/commonsense/metanl/blob/master/metanl/token_utils.py
+        Returns:
+            pd.Series: _description_
         """
-        Untokenizing a text undoes the tokenizing operation, restoring
-        punctuation and spaces to the places that people expect them to be.
-        Ideally, `untokenize(tokenize(text))` should be identical to `text`,
-        except for line breaks.
-        """
-        text = " ".join(words)
-        step1 = text.replace("`` ", '"').replace(" ''", '"').replace(". . .", "...")
-        step2 = step1.replace(" ( ", " (").replace(" ) ", ") ")
-        step3 = re.sub(r' ([.,:;?!%]+)([ \'"`])', r"\1\2", step2)
-        step4 = re.sub(r" ([.,:;?!%]+)$", r"\1", step3)
-        step5 = (
-            step4.replace(" '", "'").replace(" n't", "n't").replace("can not", "cannot")
-        )
-        step6 = step5.replace(" ` ", " '")
-        return step6.strip()
 
-    def remove_stopwords(self, text):
-        tokens = nltk.word_tokenize(text)
-        text = [t for t in tokens if t.lower() not in self.stop_words]
-        return self.untokenize(text)
-
-    def lower_transform(self, text):
-        return text.lower()
-
-    def __call__(self, text):
-        text = self.remove_stopwords(text)
-        text = self.lower_transform(text)
-        return text
+        return pd.Series()
 
 
 # ====================================================
@@ -972,8 +977,6 @@ class Model(nn.Module):
         )
 
         self.head = eval(head_type)(in_features=config.hidden_size, **head_params)
-        for module in self.head.modules():
-            self._init_weights(module, config)
 
     def forward(self, x):
         last_hidden_state = self.encoder(**x)["last_hidden_state"]
@@ -982,19 +985,6 @@ class Model(nn.Module):
         else:
             output = self.head(last_hidden_state)
         return output.view(-1)
-
-    def _init_weights(self, module, config):
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
 
 
 def get_optimizer_params(model, encoder_lr, head_lr, weight_decay=0.0):
@@ -1264,19 +1254,19 @@ def premain(directory):
 # ====================================================
 CONFIG_STRING = """
 
-RUN_NAME: exp010
-RUN_DESC: "bert-for-patents 10 folds"
+RUN_NAME: exp009
+RUN_DESC: "deberta-v3-large lower_case_input remove_stopwords"
 
 globals:
   fold: null # indicate when training
   seed: 42
-  n_fold: 10
+  n_fold: 5
   work_dir: /workspaces/us-patent-phrase-to-phrase-matching/work
   input_dir: ../input/us-patent-phrase-to-phrase-matching
   input_cpc_dir: ../input/cpc-data
   input_nltk_dir: ../input/nltk-downloads
   input_huggingface_dir: ../input/huggingface-models
-  debug: True
+  debug: False
 
 training:
   device: cuda
@@ -1301,7 +1291,7 @@ model:
     path: "@/model/encoder_path"
   encoder_path:
     type: path_join
-    ls: ["@/globals/input_huggingface_dir", "anferico/bert-for-patents"]
+    ls: ["@/globals/input_huggingface_dir", "microsoft/deberta-v3-large"]
   encoder_params:
     hidden_dropout_prob: 0.10
     attention_probs_dropout_prob: 0.10
@@ -1318,7 +1308,7 @@ tokenizer:
   type: Tokenizer
   tokenizer_path: "@/model/encoder_path"
   tokenizer_params: {}
-  max_length: 192
+  max_length: 150
 
 dataset:
   train:

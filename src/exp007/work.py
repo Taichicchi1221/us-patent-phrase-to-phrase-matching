@@ -49,7 +49,6 @@ from sklearn.impute import KNNImputer
 
 from scipy.stats import pearsonr
 
-import nltk
 import transformers
 
 import torch
@@ -660,13 +659,7 @@ class SAM(torch.optim.Optimizer):
 # dataset
 # ====================================================
 class Dataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        df=None,
-        tokenizer=None,
-        input_cpc_dir=None,
-        input_nltk_dir=None,
-    ):
+    def __init__(self, df=None, tokenizer=None, input_cpc_dir=None):
         if df is not None:
             self.anchors = df["anchor"].to_numpy()
             self.targets = df["target"].to_numpy()
@@ -678,9 +671,6 @@ class Dataset(torch.utils.data.Dataset):
 
         assert input_cpc_dir is not None
         self.cpc_texts = get_cpc_texts(input_cpc_dir)
-
-        assert input_nltk_dir is not None
-        self.preprocessor = Preprocessor(input_nltk_dir=input_nltk_dir)
 
     def __len__(self):
         return self.length
@@ -712,58 +702,25 @@ class Dataset(torch.utils.data.Dataset):
         """
 
         sep = self.tokenizer.tokenizer.sep_token
-        anchor = self.preprocessor(self.anchors[idx])
-        target = self.preprocessor(self.targets[idx])
-        cpc_text = self.preprocessor(self.cpc_texts[self.contexts[idx]])
-
-        text = f"{anchor} {sep} {target} {sep} {cpc_text}"
-        text = self.preprocessor(text)
+        text = f"{self.anchors[idx]} {sep} {self.targets[idx]} {sep} {self.cpc_texts[self.contexts[idx]]}"
 
         encoded = self.tokenizer.encode(text)
         score = self.scores[idx].astype("float32")
 
         return (encoded, score)
 
+    @classmethod
+    def postprocess(cls, d: dict):
+        """_summary_
 
-class Preprocessor(object):
-    def __init__(self, input_nltk_dir) -> None:
-        if input_nltk_dir not in nltk.data.path:
-            nltk.data.path.append(input_nltk_dir)
+        Args:
+            d (dict): _description_
 
-        self.stop_words = set(nltk.corpus.stopwords.words("english"))
-
-    @staticmethod
-    def untokenize(words):
-        # from https://github.com/commonsense/metanl/blob/master/metanl/token_utils.py
+        Returns:
+            pd.Series: _description_
         """
-        Untokenizing a text undoes the tokenizing operation, restoring
-        punctuation and spaces to the places that people expect them to be.
-        Ideally, `untokenize(tokenize(text))` should be identical to `text`,
-        except for line breaks.
-        """
-        text = " ".join(words)
-        step1 = text.replace("`` ", '"').replace(" ''", '"').replace(". . .", "...")
-        step2 = step1.replace(" ( ", " (").replace(" ) ", ") ")
-        step3 = re.sub(r' ([.,:;?!%]+)([ \'"`])', r"\1\2", step2)
-        step4 = re.sub(r" ([.,:;?!%]+)$", r"\1", step3)
-        step5 = (
-            step4.replace(" '", "'").replace(" n't", "n't").replace("can not", "cannot")
-        )
-        step6 = step5.replace(" ` ", " '")
-        return step6.strip()
 
-    def remove_stopwords(self, text):
-        tokens = nltk.word_tokenize(text)
-        text = [t for t in tokens if t.lower() not in self.stop_words]
-        return self.untokenize(text)
-
-    def lower_transform(self, text):
-        return text.lower()
-
-    def __call__(self, text):
-        text = self.remove_stopwords(text)
-        text = self.lower_transform(text)
-        return text
+        return pd.Series()
 
 
 # ====================================================
@@ -972,8 +929,6 @@ class Model(nn.Module):
         )
 
         self.head = eval(head_type)(in_features=config.hidden_size, **head_params)
-        for module in self.head.modules():
-            self._init_weights(module, config)
 
     def forward(self, x):
         last_hidden_state = self.encoder(**x)["last_hidden_state"]
@@ -982,19 +937,6 @@ class Model(nn.Module):
         else:
             output = self.head(last_hidden_state)
         return output.view(-1)
-
-    def _init_weights(self, module, config):
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
 
 
 def get_optimizer_params(model, encoder_lr, head_lr, weight_decay=0.0):
@@ -1264,19 +1206,19 @@ def premain(directory):
 # ====================================================
 CONFIG_STRING = """
 
-RUN_NAME: exp010
-RUN_DESC: "bert-for-patents 10 folds"
+RUN_NAME: exp007
+RUN_DESC: "bert-for-patents with BCE"
 
 globals:
   fold: null # indicate when training
   seed: 42
-  n_fold: 10
+  n_fold: 5
   work_dir: /workspaces/us-patent-phrase-to-phrase-matching/work
   input_dir: ../input/us-patent-phrase-to-phrase-matching
   input_cpc_dir: ../input/cpc-data
   input_nltk_dir: ../input/nltk-downloads
   input_huggingface_dir: ../input/huggingface-models
-  debug: True
+  debug: False
 
 training:
   device: cuda
@@ -1296,12 +1238,10 @@ model_filename: {type: str_concat, ls: [model_, "@/model/encoder_name/", _fold, 
 
 model:
   type: Model
-  encoder_name: 
+  encoder_name:
     type: get_encoder_name
     path: "@/model/encoder_path"
-  encoder_path:
-    type: path_join
-    ls: ["@/globals/input_huggingface_dir", "anferico/bert-for-patents"]
+  encoder_path: {type: path_join, ls: ["@/globals/input_huggingface_dir", "anferico/bert-for-patents"]}
   encoder_params:
     hidden_dropout_prob: 0.10
     attention_probs_dropout_prob: 0.10
@@ -1318,7 +1258,7 @@ tokenizer:
   type: Tokenizer
   tokenizer_path: "@/model/encoder_path"
   tokenizer_params: {}
-  max_length: 192
+  max_length: 150
 
 dataset:
   train:
@@ -1326,19 +1266,16 @@ dataset:
     df: null  # set by lazy_init
     tokenizer: "@/tokenizer"
     input_cpc_dir: "@/globals/input_cpc_dir"
-    input_nltk_dir: "@/globals/input_nltk_dir"
   valid:
     type: Dataset
     df: null  # set by lazy_init
     tokenizer: "@/tokenizer"
     input_cpc_dir: "@/globals/input_cpc_dir"
-    input_nltk_dir: "@/globals/input_nltk_dir"
   test:
     type: Dataset
     df: null  # set by lazy_init
     tokenizer: "@/tokenizer"
     input_cpc_dir: "@/globals/input_cpc_dir"
-    input_nltk_dir: "@/globals/input_nltk_dir"
 
 
 dataloader:
@@ -1374,7 +1311,7 @@ optimizer:
     model: "@/model"
     encoder_lr: 1.0e-05
     head_lr:    2.0e-05
-    weight_decay: 0.00
+    weight_decay: 0.0
   # momentum: 0.0
   # weight_decay: 0.001 # AdamW, Lamb, RAdam
   # betas: [0.9, 0.999] # Lamb, RAdam
@@ -1397,7 +1334,7 @@ scheduler:
   # T_mult: 2 # CosineAnnealingWarmRestarts
   # eta_min: 1.0e-12 # CosineAnnealingLR, CosineAnnealingWarmRestarts
   
-  max_lr: [5.0e-05, 5.0e-05, 5.0e-05] # lr of [encoder, encoder(nodecay), head] # OneCycleLR
+  max_lr: [5.0e-05, 5.0e-05, 1.0e-04] # lr of [encoder, encoder(nodecay), head] # OneCycleLR
   pct_start: 0.1 # OneCycleLR
   steps_per_epoch: "@/training/steps_per_epoch" # OneCycleLR
   epochs: "@/training/max_epochs" # OneCycleLR
@@ -1407,7 +1344,7 @@ scheduler:
   
   verbose: False
 
-loss: {type: MSEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
+loss: {type: BCEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
 
 metric: 
   mse_loss: {type: MSEWithLogitsMetric, compute_on_step: False}
@@ -1433,17 +1370,19 @@ extensions:
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
   - extension: {type: PlotReport, y_keys: lr, x_key: iteration, filename: {type: str_concat, ls: [lr_fold, "@/globals/fold", .png]}}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
-  - extension: {type: PlotReport, y_keys: [valid/mse_loss], x_key: epoch, filename: {type: str_concat, ls: [mse_loss_fold, "@/globals/fold", .png]}}
+  - extension: {type: PlotReport, y_keys: [train/mse_loss, valid/mse_loss], x_key: epoch, filename: {type: str_concat, ls: [mse_loss_fold, "@/globals/fold", .png]}}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
-  - extension: {type: PlotReport, y_keys: [valid/bce_loss], x_key: epoch, filename: {type: str_concat, ls: [bce_loss_fold, "@/globals/fold", .png]}}
+  - extension: {type: PlotReport, y_keys: [train/bce_loss, valid/bce_loss], x_key: epoch, filename: {type: str_concat, ls: [bce_loss_fold, "@/globals/fold", .png]}}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
-  - extension: {type: PlotReport, y_keys: [valid/metric], x_key: epoch, filename: {type: str_concat, ls: [metrics_fold, "@/globals/fold", .png]}}
+  - extension: {type: PlotReport, y_keys: [train/metric, valid/metric], x_key: epoch, filename: {type: str_concat, ls: [metrics_fold, "@/globals/fold", .png]}}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
-  - extension: {type: PrintReport, entries: [epoch, iteration, lr, loss, valid/mse_loss, valid/bce_loss, valid/metric, elapsed_time]}
+  - extension: {type: PrintReport, entries: [epoch, iteration, lr, loss, train/mse_loss, train/bce_loss, train/metric, valid/mse_loss, valid/bce_loss, valid/metric, elapsed_time]}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
   - extension: {type: ProgressBar, update_interval: 1}
     trigger: {type: IntervalTrigger, period: 1, unit: iteration}
   # evaluator
+  - extension: {type: Evaluator, loader: "@/dataloader/train", prefix: "train/", model: "@/model", metrics: "@/metric", device: "@/training/device"}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
   - extension: {type: Evaluator, loader: "@/dataloader/valid", prefix: "valid/", model: "@/model", metrics: "@/metric", device: "@/training/device"}
     trigger: {type: IntervalTrigger, period: 1, unit: epoch}
 """
@@ -1461,7 +1400,6 @@ CONFIG_TYPES = {
     "integer_div": lambda x, y: x // y,
     "integer_div_ceil": lambda x, y: (x + y - 1) // y,
     # # Dataset, DataLoader
-    "Preprocessor": Preprocessor,
     "Tokenizer": Tokenizer,
     "Dataset": Dataset,
     "DataLoader": torch.utils.data.DataLoader,
