@@ -1,0 +1,10 @@
+- RUN_NAME=exp038
+- RUN_DESC=deberta-v3-xsmall\ searching\ folds\ best
+- model_encoder_name=microsoft/deberta-v3-xsmall
+- training.max_epochs=10
+- training.max_grad_norm=10.0
+- optimizer.params.encoder_lr=1e-05
+- optimizer.params.head_lr=1e-05
+- scheduler.max_lr=[5e-05,5e-05,5e-05]
+- dataloader.train.batch_size=32
+- globals.n_fold=5

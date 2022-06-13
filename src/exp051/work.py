@@ -1197,7 +1197,6 @@ def train_fold(CFG, fold):
 
     while not manager.stop_trigger:
         model.train()
-        optimizer.zero_grad()
         for batch_idx, batch in enumerate(train_dataloader):
             with manager.run_iteration():
                 for k in batch.keys():
@@ -1456,7 +1455,6 @@ CONFIG_TYPES = {
     "CNNHead": CNNHead,
     "get_optimizer_params": get_optimizer_params,
     # # Optimizer
-    "SGD": torch.optim.SGD,
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,
     "RAdam": RAdam,

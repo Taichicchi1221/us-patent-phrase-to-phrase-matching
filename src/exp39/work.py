@@ -1197,7 +1197,6 @@ def train_fold(CFG, fold):
 
     while not manager.stop_trigger:
         model.train()
-        optimizer.zero_grad()
         for batch_idx, batch in enumerate(train_dataloader):
             with manager.run_iteration():
                 for k in batch.keys():
@@ -1211,11 +1210,10 @@ def train_fold(CFG, fold):
                         loss = loss / accumulation_steps
 
                 scaler.scale(loss).backward()
-                if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_grad_norm,
-                    )
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_grad_norm,
+                )
 
                 if (batch_idx + 1) % accumulation_steps == 0:
                     scaler.step(optimizer)
@@ -1456,7 +1454,6 @@ CONFIG_TYPES = {
     "CNNHead": CNNHead,
     "get_optimizer_params": get_optimizer_params,
     # # Optimizer
-    "SGD": torch.optim.SGD,
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,
     "RAdam": RAdam,

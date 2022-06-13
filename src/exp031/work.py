@@ -289,8 +289,8 @@ class Preprocessor(object):
 
     def __call__(self, text):
         # text = self.remove_stopwords(text)
-        # text = self.transform_lower(text)
-        # text = self.replace(text, ";", ",")
+        text = self.transform_lower(text)
+        text = self.replace(text, ";", ",")
 
         return text
 
@@ -885,34 +885,6 @@ class SimpleHead(nn.Module):
         return output
 
 
-class MultiSampleDropoutHead(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        dropout_num,
-        dropout_rate,
-    ):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(in_features)
-        self.dropouts = nn.ModuleList(
-            [nn.Dropout(dropout_rate) for _ in range(dropout_num)]
-        )
-        self.linears = nn.ModuleList(
-            [nn.Linear(in_features, out_features) for _ in range(dropout_num)]
-        )
-
-    def forward(self, last_hidden_state):
-        x = self.layer_norm(last_hidden_state[:, 0, :])
-        output = torch.stack(
-            [
-                regressor(dropout(x))
-                for regressor, dropout in zip(self.linears, self.dropouts)
-            ]
-        ).mean(axis=0)
-        return output
-
-
 class AttentionHead(nn.Module):
     def __init__(self, in_features, hidden_features, out_features):
         super(AttentionHead, self).__init__()
@@ -1068,12 +1040,12 @@ class CNNHead(nn.Module):
         self.cnn2 = nn.Conv1d(
             hidden_size, out_features, kernel_size=kernel_size, padding=1
         )
-        self.prelu = nn.PReLU()
+        self.relu = nn.ReLU()
 
     def forward(self, last_hidden_state):
         x = last_hidden_state.permute(0, 2, 1)
         x = self.cnn1(x)
-        x = self.prelu(x)
+        x = self.relu(x)
         x = self.cnn2(x)
         x, _ = torch.max(x, 2)
         return x
@@ -1197,7 +1169,6 @@ def train_fold(CFG, fold):
 
     while not manager.stop_trigger:
         model.train()
-        optimizer.zero_grad()
         for batch_idx, batch in enumerate(train_dataloader):
             with manager.run_iteration():
                 for k in batch.keys():
@@ -1211,11 +1182,10 @@ def train_fold(CFG, fold):
                         loss = loss / accumulation_steps
 
                 scaler.scale(loss).backward()
-                if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_grad_norm,
-                    )
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_grad_norm,
+                )
 
                 if (batch_idx + 1) % accumulation_steps == 0:
                     scaler.step(optimizer)
@@ -1283,11 +1253,6 @@ def training_main(PRE_EVAL_CFG, results):
     # prepare
     oof_df = pd.DataFrame({"id": train_df["id"], "score": np.zeros(len(train_df))})
     for fold in range(PRE_EVAL_CFG["globals"]["n_fold"]):
-        if (
-            PRE_EVAL_CFG["globals"]["use_folds"] is not None
-            and fold not in PRE_EVAL_CFG["globals"]["use_folds"]
-        ):
-            continue
         train_idx = train_df.loc[train_df["fold"] != fold].index
         valid_idx = train_df.loc[train_df["fold"] == fold].index
 
@@ -1309,15 +1274,10 @@ def training_main(PRE_EVAL_CFG, results):
 
         results.model_paths.append(model_path)
 
-    metric = CFG["/metric/metric"]
-    metric.reset()
-
-    pred_sigmoid = isinstance(metric, PearsonCorrCoefWithLogitsMetric)
-    if pred_sigmoid:
-        oof_df["score"] = sigmoid(oof_df["score"])
-
     oof_df.to_csv("oof.csv", index=False)
 
+    metric = CFG["/metric/metric"]
+    metric.reset()
     metric(torch.tensor(oof_df["score"]), torch.tensor(train_df["score"]))
     validation_score = float(metric.compute().detach().cpu().numpy())
 
@@ -1325,6 +1285,7 @@ def training_main(PRE_EVAL_CFG, results):
     results.metrics.update({"valid_score": validation_score})
 
     # plots
+    pred_sigmoid = isinstance(metric, PearsonCorrCoefWithLogitsMetric)
     plot_dist(
         train_df["score"].to_numpy(),
         oof_df["score"].to_numpy(),
@@ -1407,7 +1368,6 @@ def save_results_main(PRE_EVAL_CFG, results):
     # artifacts
     filename = "results.pkl"
     joblib.dump(results, filename)
-    OmegaConf.save(PRE_EVAL_CFG, "config.yaml")
     for filename in glob.glob("./*"):
         client.log_artifact(run.info.run_id, filename)
 
@@ -1456,7 +1416,6 @@ CONFIG_TYPES = {
     "CNNHead": CNNHead,
     "get_optimizer_params": get_optimizer_params,
     # # Optimizer
-    "SGD": torch.optim.SGD,
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,
     "RAdam": RAdam,

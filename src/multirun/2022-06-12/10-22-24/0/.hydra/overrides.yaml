@@ -1,0 +1,6 @@
+- RUN_NAME=exp050
+- RUN_DESC=deberta-v3-base\ for\ stacking
+- model_encoder_name=microsoft/deberta-v3-base
+- globals.use_folds=[0]
+- model.head_params.dropout_rate=0.0
+- mlflow.save_results=False

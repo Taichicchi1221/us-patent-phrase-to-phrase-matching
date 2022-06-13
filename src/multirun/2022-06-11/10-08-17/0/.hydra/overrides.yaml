@@ -1,0 +1,6 @@
+- RUN_NAME=
+- RUN_DESC=
+- model_encoder_name=microsoft/deberta-v3-xsmall
+- mlflow.save_results=False
+- optimizer.params.weight_decay=0.001
+- optimizer.eps=1e-07

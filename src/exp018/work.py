@@ -26,8 +26,6 @@ from tqdm.auto import tqdm
 import joblib
 
 from box import Box
-from omegaconf import DictConfig, OmegaConf
-import hydra
 
 import numpy as np
 import pandas as pd
@@ -139,9 +137,7 @@ def clear_work(directory):
 # ====================================================
 # plots
 # ====================================================
-def plot_dist(ytrue, ypred, pred_sigmoid, filename):
-    if pred_sigmoid:
-        ypred = sigmoid(ypred)
+def plot_dist(ytrue, ypred, filename):
     plt.figure()
     plt.hist(ytrue, alpha=0.5, bins=20)
     plt.hist(ypred, alpha=0.5, bins=20)
@@ -150,9 +146,7 @@ def plot_dist(ytrue, ypred, pred_sigmoid, filename):
     plt.close()
 
 
-def plot_scatter(ytrue, ypred, pred_sigmoid, filename):
-    if pred_sigmoid:
-        ypred = sigmoid(ypred)
+def plot_scatter(ytrue, ypred, filename):
     plt.figure()
     sns.scatterplot(x=ypred, y=ytrue)
     plt.savefig(filename)
@@ -278,7 +272,7 @@ class Preprocessor(object):
 
     def remove_stopwords(self, text):
         tokens = nltk.word_tokenize(text)
-        text = self.untokenize([t for t in tokens if t.lower() not in self.stop_words])
+        text = [t for t in tokens if t.lower() not in self.stop_words]
         return text
 
     def transform_lower(self, text):
@@ -289,8 +283,7 @@ class Preprocessor(object):
 
     def __call__(self, text):
         # text = self.remove_stopwords(text)
-        # text = self.transform_lower(text)
-        # text = self.replace(text, ";", ",")
+        text = self.transform_lower(text)
 
         return text
 
@@ -325,8 +318,7 @@ class BCEMetric(torchmetrics.Metric):
         self.l = 0
 
     def update(self, yhat, y):
-        eps = 1e-07
-        yhat = torch.clamp(yhat.view(-1), min=eps, max=1 - eps)
+        yhat = yhat.view(-1)
         y = y.view(-1)
         self.value += F.binary_cross_entropy(yhat, y, reduction="sum")
         self.l += int(y.size()[0])
@@ -751,7 +743,6 @@ class Dataset(torch.utils.data.Dataset):
         if df is not None:
             self.anchors = df["anchor"].apply(self.preprocessor).to_numpy()
             self.targets = df["target"].apply(self.preprocessor).to_numpy()
-            self.cpc_sections = ("[" + df["context"].str[0] + "]").to_numpy()
             self.cpc_titles = (
                 df["context"]
                 .apply(lambda x: self.cpc_texts[x[0]])
@@ -768,18 +759,13 @@ class Dataset(torch.utils.data.Dataset):
             self.length = len(df)
 
     def __getitem__(self, idx):
-
-        # select sep_token
-        # sep = self.tokenizer.sep_token
-        sep = "[s]"
-
+        sep = self.tokenizer.sep_token
         anchor = self.anchors[idx]
         target = self.targets[idx]
-        cpc_section = self.cpc_sections[idx]
         cpc_title = self.cpc_titles[idx]
         cpc_context = self.cpc_contexts[idx]
 
-        text = f"{cpc_section} {sep} {anchor} {sep} {target} {sep} {cpc_context}"
+        text = f"{anchor} {sep} {target} {sep} {cpc_context}"
         output = self.tokenizer.encode_plus(
             text,
             max_length=self.max_length,
@@ -856,10 +842,6 @@ def get_tokenizer(tokenizer_path, tokenizer_params):
         local_files_only=True,
     )
 
-    # add tokens
-    sectoks = ["[" + s + "]" for s in "ABCDEFGHs"]
-    tokenizer.add_special_tokens({"additional_special_tokens": sectoks})
-
     return tokenizer
 
 
@@ -882,34 +864,6 @@ class SimpleHead(nn.Module):
         x = self.layer_norm(last_hidden_state[:, 0, :])
         x = self.dropout(x)
         output = self.linear(x)
-        return output
-
-
-class MultiSampleDropoutHead(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        dropout_num,
-        dropout_rate,
-    ):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(in_features)
-        self.dropouts = nn.ModuleList(
-            [nn.Dropout(dropout_rate) for _ in range(dropout_num)]
-        )
-        self.linears = nn.ModuleList(
-            [nn.Linear(in_features, out_features) for _ in range(dropout_num)]
-        )
-
-    def forward(self, last_hidden_state):
-        x = self.layer_norm(last_hidden_state[:, 0, :])
-        output = torch.stack(
-            [
-                regressor(dropout(x))
-                for regressor, dropout in zip(self.linears, self.dropouts)
-            ]
-        ).mean(axis=0)
         return output
 
 
@@ -985,12 +939,12 @@ class MeanPoolingHead(nn.Module):
 
 class MeanMaxPoolingHead(nn.Module):
     def __init__(self, in_features, out_features) -> None:
+        self.linear = nn.Linear(in_features * 2, 1)
         super().__init__()
-        self.linear = nn.Linear(in_features * 2, out_features)
 
     def forward(self, last_hidden_state):
         mean_pooling_embeddings = torch.mean(last_hidden_state, 1)
-        max_pooling_embeddings, _ = torch.max(last_hidden_state, 1)
+        _, max_pooling_embeddings = torch.max(last_hidden_state, 1)
         mean_max_embeddings = torch.cat(
             (
                 mean_pooling_embeddings,
@@ -1068,12 +1022,12 @@ class CNNHead(nn.Module):
         self.cnn2 = nn.Conv1d(
             hidden_size, out_features, kernel_size=kernel_size, padding=1
         )
-        self.prelu = nn.PReLU()
+        self.relu = nn.ReLU()
 
     def forward(self, last_hidden_state):
         x = last_hidden_state.permute(0, 2, 1)
         x = self.cnn1(x)
-        x = self.prelu(x)
+        x = self.relu(x)
         x = self.cnn2(x)
         x, _ = torch.max(x, 2)
         return x
@@ -1085,7 +1039,6 @@ class Model(nn.Module):
         encoder_name,
         encoder_path,
         encoder_params,
-        embedding_length,
         head_type,
         head_params,
     ):
@@ -1102,7 +1055,6 @@ class Model(nn.Module):
             config=config,
             local_files_only=True,
         )
-        self.encoder.resize_token_embeddings(embedding_length)
 
         self.head = eval(head_type)(in_features=config.hidden_size, **head_params)
         for module in self.head.modules():
@@ -1197,7 +1149,6 @@ def train_fold(CFG, fold):
 
     while not manager.stop_trigger:
         model.train()
-        optimizer.zero_grad()
         for batch_idx, batch in enumerate(train_dataloader):
             with manager.run_iteration():
                 for k in batch.keys():
@@ -1211,11 +1162,10 @@ def train_fold(CFG, fold):
                         loss = loss / accumulation_steps
 
                 scaler.scale(loss).backward()
-                if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_grad_norm,
-                    )
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_grad_norm,
+                )
 
                 if (batch_idx + 1) % accumulation_steps == 0:
                     scaler.step(optimizer)
@@ -1283,11 +1233,6 @@ def training_main(PRE_EVAL_CFG, results):
     # prepare
     oof_df = pd.DataFrame({"id": train_df["id"], "score": np.zeros(len(train_df))})
     for fold in range(PRE_EVAL_CFG["globals"]["n_fold"]):
-        if (
-            PRE_EVAL_CFG["globals"]["use_folds"] is not None
-            and fold not in PRE_EVAL_CFG["globals"]["use_folds"]
-        ):
-            continue
         train_idx = train_df.loc[train_df["fold"] != fold].index
         valid_idx = train_df.loc[train_df["fold"] == fold].index
 
@@ -1309,15 +1254,10 @@ def training_main(PRE_EVAL_CFG, results):
 
         results.model_paths.append(model_path)
 
-    metric = CFG["/metric/metric"]
-    metric.reset()
-
-    pred_sigmoid = isinstance(metric, PearsonCorrCoefWithLogitsMetric)
-    if pred_sigmoid:
-        oof_df["score"] = sigmoid(oof_df["score"])
-
     oof_df.to_csv("oof.csv", index=False)
 
+    metric = CFG["/metric/metric"]
+    metric.reset()
     metric(torch.tensor(oof_df["score"]), torch.tensor(train_df["score"]))
     validation_score = float(metric.compute().detach().cpu().numpy())
 
@@ -1325,17 +1265,9 @@ def training_main(PRE_EVAL_CFG, results):
     results.metrics.update({"valid_score": validation_score})
 
     # plots
-    plot_dist(
-        train_df["score"].to_numpy(),
-        oof_df["score"].to_numpy(),
-        pred_sigmoid=pred_sigmoid,
-        filename="oof_dist_plot.png",
-    )
+    plot_dist(train_df["score"], sigmoid(oof_df["score"]), filename="oof_dist_plot.png")
     plot_scatter(
-        train_df["score"].to_numpy(),
-        oof_df["score"].to_numpy(),
-        pred_sigmoid=pred_sigmoid,
-        filename="oof_scatter_plot.png",
+        train_df["score"], sigmoid(oof_df["score"]), filename="oof_scatter_plot.png"
     )
 
 
@@ -1390,7 +1322,6 @@ def save_results_main(PRE_EVAL_CFG, results):
         shutil.copy(__file__, os.path.join(dir_, "work.py"))
         with open(os.path.join(dir_, "desc.txt"), "w") as f:
             f.write(PRE_EVAL_CFG["RUN_DESC"])
-        OmegaConf.save(PRE_EVAL_CFG, os.path.join(dir_, "config.yaml"))
 
     client.log_param(run.info.run_id, "name", PRE_EVAL_CFG["RUN_NAME"])
     client.log_param(run.info.run_id, "desc", PRE_EVAL_CFG["RUN_DESC"])
@@ -1407,7 +1338,6 @@ def save_results_main(PRE_EVAL_CFG, results):
     # artifacts
     filename = "results.pkl"
     joblib.dump(results, filename)
-    OmegaConf.save(PRE_EVAL_CFG, "config.yaml")
     for filename in glob.glob("./*"):
         client.log_artifact(run.info.run_id, filename)
 
@@ -1424,6 +1354,204 @@ def premain(directory):
 # ====================================================
 # config
 # ====================================================
+CONFIG_STRING = """
+
+RUN_NAME: exp018
+RUN_DESC: "deberta-v3-large fold=8"
+
+globals:
+  fold: null # indicate when training
+  seed: 42
+  n_fold: 8
+  work_dir: /workspaces/us-patent-phrase-to-phrase-matching/work
+  input_dir: ../input/us-patent-phrase-to-phrase-matching
+  input_cpc_dir: ../input/cpc-data
+  input_nltk_dir: ../input/nltk-downloads
+  input_huggingface_dir: ../input/huggingface-models
+  debug: False
+
+training:
+  device: cuda
+  use_amp: True
+  benchmark: False
+  deterministic: False
+  max_epochs: 10
+  max_grad_norm: 2.0
+  accumulate_gradient_batchs: 1
+  steps_per_epoch: {type: integer_div_ceil, x: {type: __len__, obj: "@/dataloader/train"}, y: "@/training/accumulate_gradient_batchs"}
+
+mlflow:
+  save_dir: ../mlruns
+  experiment_name: experiments
+  save_results: True
+
+model_filename: {type: str_concat, ls: [model_, "@/model/encoder_name/", _fold, "@/globals/fold", .pth]}
+
+model:
+  type: Model
+  encoder_name: 
+    type: get_encoder_name
+    path: "@/model/encoder_path"
+  encoder_path:
+    type: path_join
+    ls: ["@/globals/input_huggingface_dir", "microsoft/deberta-v3-large"]
+  encoder_params:
+    hidden_dropout_prob: 0.10
+    attention_probs_dropout_prob: 0.10
+  head_type: AttentionPoolHead
+  head_params:
+    out_features: 1
+    # dropout_rate: 0.10 # SimpleHead
+    # hidden_features: 1024 # AttentionHead, MaskAddedAttentionHead
+    # hidden_size: 256 # CNNHead
+    # kernel_size: 8 # CNNHead
+    # dropout: 0.10 # LSTMHead, GRUHead
+
+tokenizer:
+  type: get_tokenizer
+  tokenizer_path: "@/model/encoder_path"
+  tokenizer_params: {}
+
+dataset:
+  max_length: 256
+  train:
+    type: Dataset
+    df: null  # set by lazy_init
+    tokenizer: "@/tokenizer"
+    max_length: "@/dataset/max_length"
+    input_cpc_dir: "@/globals/input_cpc_dir"
+    input_nltk_dir: "@/globals/input_nltk_dir"
+  valid:
+    type: Dataset
+    df: null  # set by lazy_init
+    tokenizer: "@/tokenizer"
+    max_length: "@/dataset/max_length"
+    input_cpc_dir: "@/globals/input_cpc_dir"
+    input_nltk_dir: "@/globals/input_nltk_dir"
+  test:
+    type: Dataset
+    df: null  # set by lazy_init
+    tokenizer: "@/tokenizer"
+    max_length: "@/dataset/max_length"
+    input_cpc_dir: "@/globals/input_cpc_dir"
+    input_nltk_dir: "@/globals/input_nltk_dir"
+
+dataloader:
+  train: 
+    type: DataLoader
+    dataset: "@/dataset/train"
+    batch_size: 32
+    num_workers: 2
+    shuffle: True
+    pin_memory: True
+    drop_last: True
+    collate_fn:
+      type: Collate
+      tokenizer: "@/tokenizer"
+  valid: 
+    type: DataLoader
+    dataset: "@/dataset/valid"
+    batch_size: 32
+    num_workers: 2
+    shuffle: False
+    pin_memory: False
+    drop_last: False
+    collate_fn:
+      type: Collate
+      tokenizer: "@/tokenizer"
+  test: 
+    type: DataLoader
+    dataset: "@/dataset/test"
+    batch_size: 16
+    num_workers: 1
+    shuffle: False
+    pin_memory: False
+    drop_last: False
+    collate_fn:
+      type: Collate
+      tokenizer: "@/tokenizer"
+
+optimizer:
+  type: AdamW # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
+  params:
+    type: get_optimizer_params
+    model: "@/model"
+    encoder_lr: 1.0e-05
+    head_lr:    2.0e-05
+    weight_decay: 0.00
+  # momentum: 0.0
+  # weight_decay: 0.001 # AdamW, Lamb, RAdam
+  # betas: [0.9, 0.999] # Lamb, RAdam
+  # eps: 1.0e-07 # Lamb, RAdam
+  # adam: True # Lamb
+  # debias: False # Lamb
+  # rho: 0.05 # SAM
+  # adaptive: False # SAM
+  # base_optimizer: {type: getattr, obj: {type: eval, name: torch.optim}, name: Adam} # SAM
+
+scheduler:
+  type: OneCycleLR # [None, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts, OneCycleLR]
+  optimizer: "@/optimizer"
+  # mode: min # ReduceLROnPlateau
+  # factor: 0.1 # ReduceLROnPlateau
+  # patience: 2 # ReduceLROnPlateau
+  # eps: 1.0e-08 # ReduceLROnPlateau
+  # T_max: {type: __len__, obj: "@/dataloader/train"} # CosineAnnealingLR
+  # T_0: {type: __len__, obj: "@/dataloader/train"} # CosineAnnealingWarmRestarts
+  # T_mult: 2 # CosineAnnealingWarmRestarts
+  # eta_min: 1.0e-12 # CosineAnnealingLR, CosineAnnealingWarmRestarts
+  
+  max_lr: [4.0e-05, 4.0e-05, 1.0e-04] # lr of [encoder, encoder(nodecay), head] # OneCycleLR
+  pct_start: 0.1 # OneCycleLR
+  steps_per_epoch: "@/training/steps_per_epoch" # OneCycleLR
+  epochs: "@/training/max_epochs" # OneCycleLR
+  anneal_strategy: cos # OneCycleLR
+  div_factor: 1.0e+02 # OneCycleLR
+  final_div_factor: 1 # OneCycleLR
+  
+  verbose: False
+
+loss: {type: MSEWithLogitsLoss} # {MSEWithLogitsLoss, BCEWithLogitsLoss}
+
+metric: 
+  mse_loss: {type: MSEWithLogitsMetric, compute_on_step: False}
+  bce_loss: {type: BCEWithLogitsMetric, compute_on_step: False}
+  metric: {type: PearsonCorrCoefWithLogitsMetric, compute_on_step: False}
+
+manager:
+  type: ExtensionsManager
+  models: "@/model"
+  optimizers: "@/optimizer"
+  max_epochs: "@/training/max_epochs"
+  iters_per_epoch: {type: __len__, obj: "@/dataloader/train"}
+  out_dir: "@/globals/work_dir"
+
+extensions:
+  # snapshot
+  - extension: {type: snapshot, target: "@/model", n_retains: 1, filename: "@/model_filename"}
+    trigger: {type: MaxValueTrigger, key: "valid/metric", trigger: [1, epoch]}
+  # log
+  - extension: {type: observe_lr, optimizer: "@/optimizer"}
+    trigger: {type: IntervalTrigger, period: 1, unit: iteration}
+  - extension: {type: LogReport, filename: {type: str_concat, ls: [log_fold, "@/globals/fold"]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: lr, x_key: iteration, filename: {type: str_concat, ls: [lr_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: [valid/mse_loss], x_key: epoch, filename: {type: str_concat, ls: [mse_loss_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: [valid/bce_loss], x_key: epoch, filename: {type: str_concat, ls: [bce_loss_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PlotReport, y_keys: [valid/metric], x_key: epoch, filename: {type: str_concat, ls: [metrics_fold, "@/globals/fold", .png]}}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: PrintReport, entries: [epoch, iteration, lr, loss, valid/mse_loss, valid/bce_loss, valid/metric, elapsed_time]}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+  - extension: {type: ProgressBar, update_interval: 1}
+    trigger: {type: IntervalTrigger, period: 1, unit: iteration}
+  # evaluator
+  - extension: {type: Evaluator, loader: "@/dataloader/valid", prefix: "valid/", model: "@/model", metrics: "@/metric", device: "@/training/device"}
+    trigger: {type: IntervalTrigger, period: 1, unit: epoch}
+"""
+
 
 CONFIG_TYPES = {
     # # utils
@@ -1456,7 +1584,6 @@ CONFIG_TYPES = {
     "CNNHead": CNNHead,
     "get_optimizer_params": get_optimizer_params,
     # # Optimizer
-    "SGD": torch.optim.SGD,
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,
     "RAdam": RAdam,
@@ -1477,7 +1604,7 @@ CONFIG_TYPES = {
     "PearsonCorrCoefWithLogitsMetric": PearsonCorrCoefWithLogitsMetric,
     "BCEMetric": BCEMetric,
     "MSEMetric": torchmetrics.MeanSquaredError,
-    "PearsonCorrCoefMetric": torchmetrics.PearsonCorrCoef,
+    "PearsonCorrCoef": torchmetrics.PearsonCorrCoef,
     # # PPE Extensions
     "ExtensionsManager": ppe.training.ExtensionsManager,
     "observe_lr": ppe.training.extensions.observe_lr,
@@ -1494,13 +1621,9 @@ CONFIG_TYPES = {
     "Evaluator": Evaluator,
 }
 
+if __name__ == "__main__":
 
-@hydra.main(config_path=".", config_name="config", version_base=None)
-def main(cfg: DictConfig):
-
-    print(cfg)
-
-    PRE_EVAL_CFG = yaml.safe_load(OmegaConf.to_yaml(cfg))
+    PRE_EVAL_CFG = yaml.safe_load(CONFIG_STRING)
 
     # kaggle環境ならTrue
     if "KAGGLE_URL_BASE" in os.environ.keys():
@@ -1522,7 +1645,3 @@ def main(cfg: DictConfig):
 
     if PRE_EVAL_CFG["mlflow"]["save_results"]:
         results = save_results_main(PRE_EVAL_CFG, results)
-
-
-if __name__ == "__main__":
-    main()

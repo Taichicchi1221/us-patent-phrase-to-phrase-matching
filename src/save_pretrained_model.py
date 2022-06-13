@@ -1,7 +1,9 @@
 import os
 import transformers
 
-MODEL_NAME = "AI-Growth-Lab/PatentSBERTa"
+# https://huggingface.co/
+
+MODEL_NAME = "google/electra-large-discriminator"
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
 model = transformers.AutoModel.from_pretrained(MODEL_NAME)

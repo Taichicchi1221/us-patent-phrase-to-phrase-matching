@@ -1,0 +1,453 @@
+hydra:
+  run:
+    dir: /workspaces/us-patent-phrase-to-phrase-matching/work
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: MULTIRUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=MULTIRUN
+    task:
+    - RUN_NAME=exp038
+    - RUN_DESC=deberta-v3-xsmall searching folds best
+    - model_encoder_name=microsoft/deberta-v3-xsmall
+    - training.max_epochs=10
+    - training.max_grad_norm=10.0
+    - optimizer.params.encoder_lr=1.0e-05
+    - optimizer.params.head_lr=1.0e-05
+    - scheduler.max_lr=[5.0e-05, 5.0e-05, 5.0e-05]
+    - dataloader.train.batch_size=32
+    - globals.n_fold=5,15,25,30
+  job:
+    name: work
+    chdir: null
+    override_dirname: RUN_DESC=deberta-v3-xsmall searching folds best,RUN_NAME=exp038,dataloader.train.batch_size=32,globals.n_fold=5,15,25,30,model_encoder_name=microsoft/deberta-v3-xsmall,optimizer.params.encoder_lr=1.0e-05,optimizer.params.head_lr=1.0e-05,scheduler.max_lr=[5.0e-05,
+      5.0e-05, 5.0e-05],training.max_epochs=10,training.max_grad_norm=10.0
+    id: ???
+    num: ???
+    config_name: config
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.2.0
+    version_base: '1.2'
+    cwd: /workspaces/us-patent-phrase-to-phrase-matching/src
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /workspaces/us-patent-phrase-to-phrase-matching/src
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: ???
+    choices:
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false
+RUN_NAME: exp038
+RUN_DESC: deberta-v3-xsmall searching folds best
+globals:
+  fold: null
+  seed: 42
+  n_fold: 5
+  work_dir: /workspaces/us-patent-phrase-to-phrase-matching/work
+  input_dir: ../input/us-patent-phrase-to-phrase-matching
+  input_cpc_dir: ../input/cpc-data
+  input_nltk_dir: ../input/nltk-downloads
+  input_huggingface_dir: ../input/huggingface-models
+  debug: false
+training:
+  device: cuda
+  use_amp: true
+  benchmark: false
+  deterministic: true
+  max_epochs: 10
+  max_grad_norm: 10.0
+  accumulate_gradient_batchs: 1
+  steps_per_epoch:
+    type: integer_div_ceil
+    x:
+      type: __len__
+      obj: '@/dataloader/train'
+    'y': '@/training/accumulate_gradient_batchs'
+mlflow:
+  save_dir: ../mlruns
+  experiment_name: experiments
+  save_results: true
+model_encoder_name: microsoft/deberta-v3-xsmall
+model_filename:
+  type: str_concat
+  ls:
+  - model_
+  - '@/model/encoder_name/'
+  - _fold
+  - '@/globals/fold'
+  - .pth
+model:
+  type: Model
+  encoder_name:
+    type: get_encoder_name
+    path: '@/model_encoder_name'
+  encoder_path:
+    type: path_join
+    ls:
+    - '@/globals/input_huggingface_dir'
+    - '@/model_encoder_name'
+  encoder_params:
+    hidden_dropout_prob: 0.1
+    attention_probs_dropout_prob: 0.1
+  embedding_length:
+    type: __len__
+    obj: '@/tokenizer'
+  head_type: SimpleHead
+  head_params:
+    out_features: 1
+    dropout_rate: 0.1
+tokenizer:
+  type: get_tokenizer
+  tokenizer_path: '@/model/encoder_path'
+  tokenizer_params: {}
+preprocessor:
+  type: Preprocessor
+  input_nltk_dir: '@/globals/input_nltk_dir'
+dataset:
+  max_length: 256
+  train:
+    type: Dataset
+    df: null
+    tokenizer: '@/tokenizer'
+    max_length: '@/dataset/max_length'
+    input_cpc_dir: '@/globals/input_cpc_dir'
+    input_nltk_dir: '@/globals/input_nltk_dir'
+  valid:
+    type: Dataset
+    df: null
+    tokenizer: '@/tokenizer'
+    max_length: '@/dataset/max_length'
+    input_cpc_dir: '@/globals/input_cpc_dir'
+    input_nltk_dir: '@/globals/input_nltk_dir'
+  test:
+    type: Dataset
+    df: null
+    tokenizer: '@/tokenizer'
+    max_length: '@/dataset/max_length'
+    input_cpc_dir: '@/globals/input_cpc_dir'
+    input_nltk_dir: '@/globals/input_nltk_dir'
+dataloader:
+  train:
+    type: DataLoader
+    dataset: '@/dataset/train'
+    batch_size: 32
+    num_workers: 2
+    shuffle: true
+    pin_memory: true
+    drop_last: true
+    collate_fn:
+      type: Collate
+      tokenizer: '@/tokenizer'
+  valid:
+    type: DataLoader
+    dataset: '@/dataset/valid'
+    batch_size: 16
+    num_workers: 2
+    shuffle: false
+    pin_memory: false
+    drop_last: false
+    collate_fn:
+      type: Collate
+      tokenizer: '@/tokenizer'
+  test:
+    type: DataLoader
+    dataset: '@/dataset/test'
+    batch_size: 16
+    num_workers: 1
+    shuffle: false
+    pin_memory: false
+    drop_last: false
+    collate_fn:
+      type: Collate
+      tokenizer: '@/tokenizer'
+optimizer:
+  type: AdamW
+  params:
+    type: get_optimizer_params
+    model: '@/model'
+    encoder_lr: 1.0e-05
+    head_lr: 1.0e-05
+    weight_decay: 0.0
+scheduler:
+  type: OneCycleLR
+  optimizer: '@/optimizer'
+  max_lr:
+  - 5.0e-05
+  - 5.0e-05
+  - 5.0e-05
+  pct_start: 0.1
+  steps_per_epoch: '@/training/steps_per_epoch'
+  epochs: '@/training/max_epochs'
+  anneal_strategy: cos
+  div_factor: 100.0
+  final_div_factor: 1
+  verbose: false
+loss:
+  type: MSELoss
+metric:
+  mse_loss:
+    type: MSEMetric
+    compute_on_step: false
+  bce_loss:
+    type: BCEMetric
+    compute_on_step: false
+  metric:
+    type: PearsonCorrCoefMetric
+    compute_on_step: false
+manager:
+  type: ExtensionsManager
+  models: '@/model'
+  optimizers: '@/optimizer'
+  max_epochs: '@/training/max_epochs'
+  iters_per_epoch:
+    type: __len__
+    obj: '@/dataloader/train'
+  out_dir: '@/globals/work_dir'
+extensions:
+- extension:
+    type: snapshot
+    target: '@/model'
+    n_retains: 1
+    filename: '@/model_filename'
+  trigger:
+    type: MaxValueTrigger
+    key: valid/metric
+    trigger:
+    - 1
+    - epoch
+- extension:
+    type: observe_lr
+    optimizer: '@/optimizer'
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: iteration
+- extension:
+    type: LogReport
+    filename:
+      type: str_concat
+      ls:
+      - log_fold
+      - '@/globals/fold'
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch
+- extension:
+    type: PlotReport
+    y_keys: lr
+    x_key: iteration
+    filename:
+      type: str_concat
+      ls:
+      - lr_fold
+      - '@/globals/fold'
+      - .png
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch
+- extension:
+    type: PlotReport
+    y_keys:
+    - valid/mse_loss
+    x_key: epoch
+    filename:
+      type: str_concat
+      ls:
+      - mse_loss_fold
+      - '@/globals/fold'
+      - .png
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch
+- extension:
+    type: PlotReport
+    y_keys:
+    - valid/bce_loss
+    x_key: epoch
+    filename:
+      type: str_concat
+      ls:
+      - bce_loss_fold
+      - '@/globals/fold'
+      - .png
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch
+- extension:
+    type: PlotReport
+    y_keys:
+    - valid/metric
+    x_key: epoch
+    filename:
+      type: str_concat
+      ls:
+      - metrics_fold
+      - '@/globals/fold'
+      - .png
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch
+- extension:
+    type: PrintReport
+    entries:
+    - epoch
+    - iteration
+    - lr
+    - loss
+    - valid/mse_loss
+    - valid/bce_loss
+    - valid/metric
+    - elapsed_time
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch
+- extension:
+    type: ProgressBar
+    update_interval: 1
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: iteration
+- extension:
+    type: Evaluator
+    loader: '@/dataloader/valid'
+    prefix: valid/
+    model: '@/model'
+    metrics: '@/metric'
+    device: '@/training/device'
+  trigger:
+    type: IntervalTrigger
+    period: 1
+    unit: epoch

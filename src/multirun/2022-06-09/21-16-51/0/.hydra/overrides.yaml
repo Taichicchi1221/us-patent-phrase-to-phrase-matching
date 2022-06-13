@@ -1,0 +1,4 @@
+- RUN_NAME=exp038
+- RUN_DESC=deberta-v3-small\ searching\ folds\ best
+- model_encoder_name=deberta-v3-small
+- globals.n_fold=5
