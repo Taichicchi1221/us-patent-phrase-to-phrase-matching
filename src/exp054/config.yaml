@@ -1,5 +1,5 @@
-RUN_NAME: exp053
-RUN_DESC: deberta-v3-large for stacking
+RUN_NAME: exp054
+RUN_DESC: deberta-v3-large lowercase/bce/attentionpoolhead for stacking
 globals:
   fold: null
   seed: 1221
@@ -54,11 +54,9 @@ model:
   embedding_length:
     type: __len__
     obj: '@/tokenizer'
-  head_type: MultiSampleDropoutHead
+  head_type: AttentionPoolHead
   head_params:
     out_features: 1
-    dropout_rate: 0.25
-    dropout_num: 5
 tokenizer:
   type: get_tokenizer
   tokenizer_path: '@/model/encoder_path'
@@ -147,16 +145,16 @@ scheduler:
   final_div_factor: 1
   verbose: false
 loss:
-  type: MSELoss
+  type: BCEWithLogitsLoss
 metric:
   mse_loss:
-    type: MSEMetric
+    type: MSEWithLogitsMetric
     compute_on_step: false
   bce_loss:
-    type: BCEMetric
+    type: BCEWithLogitsMetric
     compute_on_step: false
   metric:
-    type: PearsonCorrCoefMetric
+    type: PearsonCorrCoefWithLogitsMetric
     compute_on_step: false
 manager:
   type: ExtensionsManager

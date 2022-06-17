@@ -3,7 +3,7 @@ import transformers
 
 # https://huggingface.co/
 
-MODEL_NAME = "google/electra-large-discriminator"
+MODEL_NAME = "gpt2-large"
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
 model = transformers.AutoModel.from_pretrained(MODEL_NAME)

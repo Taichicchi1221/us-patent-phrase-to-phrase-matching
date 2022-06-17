@@ -150,7 +150,7 @@ optimizer:
   eps: 1.0e-07 # Lamb, RAdam
   # betas: [0.9, 0.999] # Lamb, RAdam
   # adam: True # Lamb
-  # debias: False # Lamb
+  # debias: True # Lamb
   # rho: 0.05 # SAM
   # adaptive: False # SAM
   # base_optimizer: {type: getattr, obj: {type: eval, name: torch.optim}, name: Adam} # SAM
@@ -181,7 +181,7 @@ scheduler:
 
 ## with sigmoid
 
-# loss: { type: MSEWithLogitsLoss } # {MSEWithLogitsLoss, BCEWithLogitsLoss}
+# loss: { type: BCEWithLogitsLoss } # {MSEWithLogitsLoss, BCEWithLogitsLoss}
 
 # metric:
 #   mse_loss: { type: MSEWithLogitsMetric, compute_on_step: False }

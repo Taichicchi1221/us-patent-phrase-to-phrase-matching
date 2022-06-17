@@ -289,8 +289,8 @@ class Preprocessor(object):
 
     def __call__(self, text):
         # text = self.remove_stopwords(text)
-        # text = self.transform_lower(text)
-        # text = self.replace(text, ";", ",")
+        text = self.transform_lower(text)
+        text = self.replace(text, ";", ",")
 
         return text
 
