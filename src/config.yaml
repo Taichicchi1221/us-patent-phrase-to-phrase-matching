@@ -8,18 +8,22 @@ RUN_DESC: ""
 globals:
   fold: null # indicate when training
   seed: 1221
-  n_fold: 10
+  n_fold: 5
   use_folds: null
   work_dir: /workspaces/us-patent-phrase-to-phrase-matching/work
   input_dir: ../input/us-patent-phrase-to-phrase-matching
   input_cpc_dir: ../input/cpc-data
   input_nltk_dir: ../input/nltk-downloads
   input_huggingface_dir: ../input/huggingface-models
+  input_pretrained_models_dir: ../input/pretrained-models
   debug: False
 
 training:
   device: cuda
   use_amp: True
+  scaler:
+    type: Scaler
+    enabled: "@/training/use_amp"
   benchmark: False
   deterministic: True
   max_epochs: 8
@@ -58,11 +62,11 @@ model:
     hidden_dropout_prob: 0.1
     attention_probs_dropout_prob: 0.1
   embedding_length: { type: __len__, obj: "@/tokenizer" }
-  head_type: MultiSampleDropoutHead
+  head_type: AttentionPoolHead
   head_params:
     out_features: 1
-    dropout_rate: 0.25 # SimpleHead, MultiSampleDropoutHead
-    dropout_num: 5 # MultiSampleDropoutHead
+    # dropout_rate: 0.25 # SimpleHead, MultiSampleDropoutHead
+    # dropout_num: 5 # MultiSampleDropoutHead
     # hidden_features: 1024 # AttentionHead, MaskAddedAttentionHead
     # hidden_size: 256 # CNNHead
     # kernel_size: 8 # CNNHead
@@ -72,6 +76,20 @@ tokenizer:
   type: get_tokenizer
   tokenizer_path: "@/model/encoder_path"
   tokenizer_params: {}
+
+### awp
+awp: null
+# awp:
+#   type: AWP
+#   model: "@/model"
+#   optimizer: "@/optimizer"
+#   adv_param: weight
+#   adv_lr: 1.0e-05
+#   adv_eps: 1.0e-05
+#   start_epoch: 3
+
+### sift
+sift: True
 
 ### preprocessor
 preprocessor:
@@ -139,15 +157,20 @@ dataloader:
       tokenizer: "@/tokenizer"
 
 ### optimizer, scheduler
+
+# optimizer:
+#   type: Lookahead
+#   k: 5
+#   alpha: 0.5
 optimizer:
-  type: AdamW # [SGD, Adam, AdamW, RAdam, Lamb, SAM]
+  type: AdaBelief # [SGD, Adam, AdamW, RAdam, Lamb, SAM, AdaBelief]
   params:
     type: get_optimizer_params
     model: "@/model"
     encoder_lr: 5.0e-06
     head_lr: 5.0e-06
     weight_decay: 0.00001
-  eps: 1.0e-07 # Lamb, RAdam
+  # eps: 1.0e-07 # AdamW, Lamb, RAdam, AdaBelief
   # betas: [0.9, 0.999] # Lamb, RAdam
   # adam: True # Lamb
   # debias: True # Lamb

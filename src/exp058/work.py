@@ -13,7 +13,6 @@ import typing
 import numbers
 import warnings
 import argparse
-from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 from collections.abc import MutableMapping, Iterable
@@ -62,8 +61,6 @@ import torch.nn.functional as F
 from torch.cuda import amp
 import torchtext
 import torchmetrics
-
-from adabelief_pytorch import AdaBelief
 
 import pytorch_pfn_extras as ppe
 from pytorch_pfn_extras.config import Config
@@ -217,7 +214,9 @@ class AWP:
                     # Apply the limit to the change
                     param.data.clamp_(param_min, param_max)
 
-    def _save(self):
+    def _save(self, epoch):
+        if epoch < self.start_epoch:
+            return
         for name, param in self.model.named_parameters():
             if (
                 param.requires_grad
@@ -237,226 +236,6 @@ class AWP:
         for name, param in self.model.named_parameters():
             if name in self.backup:
                 param.data.copy_(self.backup[name])
-
-
-# ====================================================
-# SiFT
-# ====================================================
-class PerturbationLayer(torch.nn.Module):
-    def __init__(self, hidden_size, learning_rate=1e-4, init_perturbation=1e-2):
-        super().__init__()
-        self.learning_rate = learning_rate
-        self.init_perturbation = init_perturbation
-        self.delta = None
-        self.LayerNorm = torch.nn.LayerNorm(hidden_size, 1e-7, elementwise_affine=False)
-        self.adversarial_mode = False
-
-    def adversarial_(self, adversarial=True):
-        self.adversarial_mode = adversarial
-        if not adversarial:
-            self.delta = None
-
-    def forward(self, input):
-        if not self.adversarial_mode:
-            self.input = self.LayerNorm(input)
-            return self.input
-        else:
-            if self.delta is None:
-                self.update_delta(requires_grad=True)
-            return self.perturbated_input
-
-    def update_delta(self, requires_grad=False):
-        if not self.adversarial_mode:
-            return True
-        if self.delta is None:
-            delta = torch.clamp(
-                self.input.new(self.input.size())
-                .normal_(0, self.init_perturbation)
-                .float(),
-                -2 * self.init_perturbation,
-                2 * self.init_perturbation,
-            )
-        else:
-            grad = self.delta.grad
-            self.delta.grad = None
-            delta = self.delta
-            norm = grad.norm()
-            if torch.isnan(norm) or torch.isinf(norm):
-                return False
-            eps = self.learning_rate
-            with torch.no_grad():
-                delta = delta + eps * grad / (
-                    1e-6 + grad.abs().max(-1, keepdim=True)[0]
-                )
-        self.delta = delta.float().detach().requires_grad_(requires_grad)
-        self.perturbated_input = (self.input.to(delta).detach() + self.delta).to(
-            self.input
-        )
-        return True
-
-
-def hook_sift_layer(
-    model,
-    hidden_size,
-    learning_rate=1e-4,
-    init_perturbation=1e-2,
-    target_module="embeddings.LayerNorm",
-):
-    """
-    Hook the sift perturbation layer to and existing model. With this method, you can apply adversarial training
-    without changing the existing model implementation.
-    Params:
-      `model`: The model instance to apply adversarial training
-      `hidden_size`: The dimmension size of the perturbated embedding
-      `learning_rate`: The learning rate to update the perturbation
-      `init_perturbation`: The initial range of perturbation
-      `target_module`: The module to apply perturbation. It can be the name of the sub-module of the model or the sub-module instance.
-      The perturbation layer will be inserted before the sub-module.
-    Outputs:
-      The perturbation layers.
-    """
-
-    if isinstance(target_module, str):
-        _modules = [k for n, k in model.named_modules() if target_module in n]
-    else:
-        assert isinstance(
-            target_module, torch.nn.Module
-        ), f"{type(target_module)} is not an instance of torch.nn.Module"
-        _modules = [target_module]
-    adv_modules = []
-    for m in _modules:
-        adv = PerturbationLayer(hidden_size, learning_rate, init_perturbation)
-
-        def adv_hook(module, inputs):
-            return adv(inputs[0])
-
-        for h in list(m._forward_pre_hooks.keys()):
-            if m._forward_pre_hooks[h].__name__ == "adv_hook":
-                del m._forward_pre_hooks[h]
-        m.register_forward_pre_hook(adv_hook)
-        adv_modules.append(adv)
-    return adv_modules
-
-
-class AdversarialLearner:
-    """Adversarial Learner
-    This class is the helper class for adversarial training.
-    Params:
-      `model`: The model instance to apply adversarial training
-      `perturbation_modules`: The sub modules in the model that will generate perturbations. If it's `None`,
-      the constructor will detect sub-modules of type `PerturbationLayer` in the model.
-    Example usage:
-    ```python
-    # Create DeBERTa model
-    adv_modules = hook_sift_layer(model, hidden_size=768)
-    adv = AdversarialLearner(model, adv_modules)
-    def logits_fn(model, *wargs, **kwargs):
-      logits,_ = model(*wargs, **kwargs)
-      return logits
-    logits,loss = model(**data)
-    loss = loss + adv.loss(logits, logits_fn, **data)
-    # Other steps is the same as general training.
-    ```
-    """
-
-    def __init__(self, model, adv_modules=None):
-        if adv_modules is None:
-            self.adv_modules = [
-                m for m in model.modules() if isinstance(m, PerturbationLayer)
-            ]
-        else:
-            self.adv_modules = adv_modules
-        self.parameters = [p for p in model.parameters()]
-        self.model = model
-        self.perturbation_loss_fns = {
-            "symmetric-kl": symmetric_kl,
-            "kl": kl,
-            "mse": mse,
-        }
-
-    def loss(self, target, logits_fn, loss_fn="symmetric-kl", *wargs, **kwargs):
-        """
-        Calculate the adversarial loss based on the given logits fucntion and loss function.
-        Inputs:
-        `target`: the logits from original inputs.
-        `logits_fn`: the function that produces logits based on perturbated inputs. E.g.,
-        ```python
-        def logits_fn(model, *wargs, **kwargs):
-          logits = model(*wargs, **kwargs)
-          return logits
-        ```
-        `loss_fn`: the function that caclulate the loss from perturbated logits and target logits.
-          - If it's a string, it can be pre-built loss functions, i.e. kl, symmetric_kl, mse.
-          - If it's a function, it will be called to calculate the loss, the signature of the function will be,
-          ```python
-          def loss_fn(source_logits, target_logits):
-            # Calculate the loss
-            return loss
-          ```
-        `*wargs`: the positional arguments that will be passed to the model
-        `**kwargs`: the key-word arguments that will be passed to the model
-        Outputs:
-          The loss based on pertubated inputs.
-        """
-        self.prepare()
-        if isinstance(loss_fn, str):
-            loss_fn = self.perturbation_loss_fns[loss_fn]
-        pert_logits = logits_fn(self.model, *wargs, **kwargs)
-        pert_loss = loss_fn(pert_logits, target.detach()).sum()
-        pert_loss.backward()
-        for m in self.adv_modules:
-            ok = m.update_delta(True)
-
-        for r, p in zip(self.prev, self.parameters):
-            p.requires_grad_(r)
-        pert_logits = logits_fn(self.model, *wargs, **kwargs)
-        pert_loss = symmetric_kl(pert_logits, target)
-
-        self.cleanup()
-        return pert_loss.mean()
-
-    def prepare(self):
-        self.prev = [p.requires_grad for p in self.parameters]
-        for p in self.parameters:
-            p.requires_grad_(False)
-        for m in self.adv_modules:
-            m.adversarial_(True)
-
-    def cleanup(self):
-        for r, p in zip(self.prev, self.parameters):
-            p.requires_grad_(r)
-
-        for m in self.adv_modules:
-            m.adversarial_(False)
-
-
-def symmetric_kl(logits, target):
-    logit_stu = logits.view(-1, logits.size(-1)).float()
-    logit_tea = target.view(-1, target.size(-1)).float()
-    logprob_stu = F.log_softmax(logit_stu, -1)
-    logprob_tea = F.log_softmax(logit_tea, -1)
-    prob_tea = logprob_tea.exp().detach()
-    prob_stu = logprob_stu.exp().detach()
-    floss = (prob_tea * (-logprob_stu)).sum(-1)  # Cross Entropy
-    bloss = (prob_stu * (-logprob_tea)).sum(-1)  # Cross Entropy
-    loss = floss + bloss
-    return loss
-
-
-def kl(logits, target):
-    logit_stu = logits.view(-1, logits.size(-1)).float()
-    logit_tea = target.view(-1, target.size(-1)).float()
-    logprob_stu = F.log_softmax(logit_stu, -1)
-    logprob_tea = F.log_softmax(logit_tea.detach(), -1)
-    prob_tea = logprob_tea.exp()
-    loss = (prob_tea * (-logprob_stu)).sum(-1)  # Cross Entropy
-    return loss
-
-
-def mse(logits, target):
-    logit_stu = logits.view(-1, logits.size(-1)).float()
-    logit_tea = target.view(-1, target.size(-1)).float()
-    return F.mse_loss(logit_stu.view(-1), logit_tea.view(-1))
 
 
 # ====================================================
@@ -1002,100 +781,6 @@ class SAM(torch.optim.Optimizer):
         self.base_optimizer.param_groups = self.param_groups
 
 
-class Lookahead(torch.optim.Optimizer):
-    # Lookahead implementation from https://github.com/rwightman/pytorch-image-models/blob/master/timm/optim/lookahead.py
-    """Lookahead Optimizer Wrapper.
-    Implementation modified from: https://github.com/alphadl/lookahead.pytorch
-    Paper: `Lookahead Optimizer: k steps forward, 1 step back` - https://arxiv.org/abs/1907.08610
-    """
-
-    def __init__(self, base_optimizer, alpha=0.5, k=6):
-        if not 0.0 <= alpha <= 1.0:
-            raise ValueError(f"Invalid slow update rate: {alpha}")
-        if not 1 <= k:
-            raise ValueError(f"Invalid lookahead steps: {k}")
-        defaults = dict(lookahead_alpha=alpha, lookahead_k=k, lookahead_step=0)
-        self.base_optimizer = base_optimizer
-        self.param_groups = self.base_optimizer.param_groups
-        self.defaults = base_optimizer.defaults
-        self.defaults.update(defaults)
-        self.state = defaultdict(dict)
-        # manually add our defaults to the param groups
-        for name, default in defaults.items():
-            for group in self.param_groups:
-                group.setdefault(name, default)
-
-    def update_slow(self, group):
-        for fast_p in group["params"]:
-            if fast_p.grad is None:
-                continue
-            param_state = self.state[fast_p]
-            if "slow_buffer" not in param_state:
-                param_state["slow_buffer"] = torch.empty_like(fast_p.data)
-                param_state["slow_buffer"].copy_(fast_p.data)
-            slow = param_state["slow_buffer"]
-            slow.add_(group["lookahead_alpha"], fast_p.data - slow)
-            fast_p.data.copy_(slow)
-
-    def sync_lookahead(self):
-        for group in self.param_groups:
-            self.update_slow(group)
-
-    def step(self, closure=None):
-        # print(self.k)
-        # assert id(self.param_groups) == id(self.base_optimizer.param_groups)
-        loss = self.base_optimizer.step(closure)
-        for group in self.param_groups:
-            group["lookahead_step"] += 1
-            if group["lookahead_step"] % group["lookahead_k"] == 0:
-                self.update_slow(group)
-        return loss
-
-    def state_dict(self):
-        fast_state_dict = self.base_optimizer.state_dict()
-        slow_state = {
-            (id(k) if isinstance(k, torch.Tensor) else k): v
-            for k, v in self.state.items()
-        }
-        fast_state = fast_state_dict["state"]
-        param_groups = fast_state_dict["param_groups"]
-        return {
-            "state": fast_state,
-            "slow_state": slow_state,
-            "param_groups": param_groups,
-        }
-
-    def load_state_dict(self, state_dict):
-        fast_state_dict = {
-            "state": state_dict["state"],
-            "param_groups": state_dict["param_groups"],
-        }
-        self.base_optimizer.load_state_dict(fast_state_dict)
-
-        # We want to restore the slow state, but share param_groups reference
-        # with base_optimizer. This is a bit redundant but least code
-        slow_state_new = False
-        if "slow_state" not in state_dict:
-            print("Loading state_dict from optimizer without Lookahead applied.")
-            state_dict["slow_state"] = defaultdict(dict)
-            slow_state_new = True
-        slow_state_dict = {
-            "state": state_dict["slow_state"],
-            "param_groups": state_dict[
-                "param_groups"
-            ],  # this is pointless but saves code
-        }
-        super(Lookahead, self).load_state_dict(slow_state_dict)
-        self.param_groups = (
-            self.base_optimizer.param_groups
-        )  # make both ref same container
-        if slow_state_new:
-            # reapply defaults to catch missing lookahead specific ones
-            for name, default in self.defaults.items():
-                for group in self.param_groups:
-                    group.setdefault(name, default)
-
-
 # ====================================================
 # dataset
 # ====================================================
@@ -1591,16 +1276,6 @@ def train_fold(CFG, fold):
 
     awp = CFG["/awp"]
 
-    sift = CFG["/sift"]
-    if sift:
-        adv_modules = hook_sift_layer(
-            model, hidden_size=model.encoder.config.hidden_size
-        )
-        adv = AdversarialLearner(model, adv_modules)
-
-    def logits_fn(model, batch):
-        return model(batch)
-
     manager = CFG["/manager"]
     for ext in CFG["/extensions"]:
         manager.extend(**ext)
@@ -1613,15 +1288,11 @@ def train_fold(CFG, fold):
                 for k in batch.keys():
                     batch[k] = batch[k].to(device)
 
-                if awp is not None:
-                    awp.perturb(epoch=manager.epoch)
+                awp.perturb(epoch=manager.epoch)
 
                 with amp.autocast(use_amp):
-                    yhat = logits_fn(model, batch)
+                    yhat = model(batch)
                     loss = loss_func(yhat, batch["score"])
-
-                    if sift:
-                        loss = loss + adv.loss(yhat, logits_fn=logits_fn, batch=batch)
 
                 if accumulation_steps > 1:
                     loss = loss / accumulation_steps
@@ -1633,8 +1304,7 @@ def train_fold(CFG, fold):
                         max_grad_norm,
                     )
 
-                if awp is not None:
-                    awp.restore()
+                awp.restore(epoch=manager.epoch)
 
                 if (batch_idx + 1) % accumulation_steps == 0:
                     scaler.step(optimizer)
@@ -1882,8 +1552,6 @@ CONFIG_TYPES = {
     "RAdam": RAdam,
     "Lamb": Lamb,
     "SAM": SAM,
-    "Lookahead": Lookahead,
-    "AdaBelief": AdaBelief,
     # # Scheduler
     "CosineAnnealingLR": torch.optim.lr_scheduler.CosineAnnealingLR,
     "CosineAnnealingWarmRestarts": torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,

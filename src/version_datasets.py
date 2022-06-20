@@ -3,17 +3,16 @@ import glob
 import subprocess
 import shutil
 
+UPLOAD = False
+
 DATASET_DIR = "/workspaces/us-patent-phrase-to-phrase-matching/datasets"
+# DATASET_DIR = "/workspaces/us-patent-phrase-to-phrase-matching/datasets/uspppm-public"
 
 EXPERIMENT_ID = "2"
 MLFLOW_DIR = f"/workspaces/us-patent-phrase-to-phrase-matching/mlruns/{EXPERIMENT_ID}"
+
 RUN_IDS = [
-    "dc95c61f15bf4ac0b9e1de3ac1299f45",
-    "9aa398aea22c4048b4e904c36bb3605b",
-    "7923146adde64b6a9643eb163d8d223f",
-    "bc8145deac9d4376b708e8b1499da970",
-    "b977b33e7f8547bcb1e62e42e021e627",
-    "e38625b57d3e4f00992c4f191a786c5d",
+    "018420c68d63460f9ad625d51bb3903f",
 ]
 
 # make zips
@@ -25,10 +24,11 @@ for run_id in RUN_IDS:
 
     shutil.make_archive(
         os.path.join(DATASET_DIR, run_id),
-        format="gztar",
+        format="zip",
         root_dir=os.path.join(MLFLOW_DIR, run_id, "artifacts"),
     )
 
 # kaggle api
-os.chdir(DATASET_DIR)
-subprocess.run("kaggle datasets version -m 'default'", shell=True)
+if UPLOAD:
+    os.chdir(DATASET_DIR)
+    subprocess.run("kaggle datasets version -r skip -m 'default'", shell=True)
